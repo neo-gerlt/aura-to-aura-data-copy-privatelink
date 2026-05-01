@@ -4,19 +4,25 @@ Migrate data between two Neo4j Aura instances over Bolt — works with **Private
 
 Instead of `neo4j-admin database upload` (which requires public traffic), this script connects to both Aura instances simultaneously over **Bolt (port 7687)** — the same protocol Private Link proxies. It reads from the source and writes to the target in batches, one phase at a time.
 
-Run from an EC2 inside the customer's VPC that has Private Link endpoints for both source and target Aura instances.
+Two modes are supported:
+
+- **`--mode=local`** — run the migration directly from the current machine. Use this when you are already inside the customer VPC (e.g. on a bastion or existing EC2).
+- **`--mode=ec2`** — the script provisions a fresh EC2 in the customer's VPC, runs the migration there, streams the output back, then terminates the instance automatically. Aura passwords are prompted interactively and stored temporarily in SSM Parameter Store — never written to disk or passed via user-data.
 
 ---
 
 ## Requirements
 
 - Python 3.9+
-- Both Aura instances reachable over Bolt from the machine running the script
 - `pip install -r requirements.txt`
+- **Local mode:** the machine must have Bolt (port 7687) access to both Aura instances
+- **EC2 mode:** AWS credentials with permissions to launch EC2, write SSM parameters, and send SSM commands; `boto3` is required (`pip install boto3`)
 
 ---
 
 ## Usage
+
+### Local mode
 
 ```bash
 export SOURCE_AURA_URI=neo4j+s://xxxx.databases.neo4j.io
@@ -25,14 +31,27 @@ export TARGET_AURA_URI=neo4j+s://yyyy.databases.neo4j.io
 export TARGET_AURA_PASSWORD=secret
 
 # Test connectivity first
-python3 aura_to_aura_migration.py --dry-run
+python3 aura_to_aura_migration.py --mode=local --dry-run
 
 # Full migration
-python3 aura_to_aura_migration.py
+python3 aura_to_aura_migration.py --mode=local
 
 # Resume after interruption
-python3 aura_to_aura_migration.py --resume
+python3 aura_to_aura_migration.py --mode=local --resume
 ```
+
+### EC2 mode
+
+```bash
+python3 aura_to_aura_migration.py --mode=ec2 \
+  --source-uri=neo4j+s://xxxx.databases.neo4j.io \
+  --target-uri=neo4j+s://yyyy.databases.neo4j.io \
+  --subnet-id=subnet-0abc1234 \
+  --security-group-id=sg-0abc1234 \
+  --instance-profile=arn:aws:iam::123456789012:instance-profile/aura-migration
+```
+
+Aura passwords are prompted interactively. The instance profile must allow `ssm:GetParameter` on `/aura-migration/*` and `ssm:SendCommand`.
 
 All connection parameters can also be passed as CLI flags — run `--help` for the full list.
 
@@ -69,12 +88,23 @@ After every batch the script writes a **checkpoint JSON file** tracking which la
 
 | Flag | Description |
 |---|---|
+| `--mode` | `local` (default) or `ec2` |
 | `--dry-run` | Connect and count source only; no writes |
 | `--resume` | Continue from last checkpoint |
 | `--overwrite` | Proceed into a non-empty target |
 | `--skip-schema` | Skip constraint/index migration |
 | `--skip-validation` | Skip post-migration count comparison |
 | `--batch-size N` | Rows per transaction (default: 5,000) |
+
+**EC2 mode flags** (required when `--mode=ec2`):
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--subnet-id` | `AWS_SUBNET_ID` | Subnet for the migration EC2 |
+| `--security-group-id` | `AWS_SECURITY_GROUP_ID` | Must allow outbound port 7687 |
+| `--instance-profile` | `AWS_INSTANCE_PROFILE` | IAM instance profile ARN |
+| `--instance-type` | — | EC2 instance type (default: `t3.medium`) |
+| `--aws-region` | `AWS_DEFAULT_REGION` | AWS region |
 
 ---
 
