@@ -1,0 +1,13 @@
+# Migration runtime artifacts
+migration_checkpoint.json
+migration_ids.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Credentials
+.env
+*.env
