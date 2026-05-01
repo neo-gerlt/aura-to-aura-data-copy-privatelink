@@ -64,6 +64,11 @@ _INDEX_CREATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# In Neo4j 5.x, "IF NOT EXISTS" must come AFTER the constraint name, not after "CREATE CONSTRAINT".
+# So we insert it before the FOR keyword instead. Matches both named ("CREATE CONSTRAINT `n` FOR …")
+# and unnamed ("CREATE CONSTRAINT FOR …") forms; the createStatement always contains FOR.
+_CONSTRAINT_FOR_RE = re.compile(r"\sFOR\s", re.IGNORECASE)
+
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
 def load_checkpoint(path: str) -> dict:
@@ -201,8 +206,10 @@ def migrate_schema(src: Driver, tgt: Driver, dry_run: bool) -> None:
     print(f"  Constraints: {len(constraints)}")
     for row in constraints:
         stmt = row["createStatement"]
-        if "IF NOT EXISTS" not in stmt:
-            stmt = stmt.replace("CREATE CONSTRAINT", "CREATE CONSTRAINT IF NOT EXISTS", 1)
+        # In Neo4j 5.x, "IF NOT EXISTS" must come AFTER the constraint name (before FOR),
+        # not right after "CREATE CONSTRAINT" — a naive prefix replace produces invalid Cypher.
+        if not re.search(r"\bIF\s+NOT\s+EXISTS\b", stmt, re.IGNORECASE):
+            stmt = _CONSTRAINT_FOR_RE.sub(" IF NOT EXISTS FOR ", stmt, count=1)
         if dry_run:
             print(f"    DRY: {stmt[:100]}")
         else:
