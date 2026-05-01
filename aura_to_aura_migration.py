@@ -42,7 +42,7 @@ except ImportError:
     HAS_TQDM = False
 
 from neo4j import GraphDatabase, Driver
-from neo4j.exceptions import AuthError, ServiceUnavailable
+from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +50,8 @@ DEFAULT_BATCH_SIZE = 5000
 DEFAULT_CHECKPOINT_FILE = "migration_checkpoint.json"
 DEFAULT_ID_MAP_DB = "migration_ids.db"
 DEFAULT_USER = "neo4j"
+
+_RETRY_DELAYS = (2, 5, 15)  # seconds between attempts on transient failures
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
@@ -123,9 +125,23 @@ def open_driver(uri: str, user: str, password: str, label: str) -> Driver:
 
 
 def run_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
-    with driver.session() as session:
-        result = session.run(cypher, params or {})
-        return [record.data() for record in result]
+    last_exc: Optional[Exception] = None
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        try:
+            with driver.session() as session:
+                result = session.run(cypher, params or {})
+                return [record.data() for record in result]
+        except (TransientError, ServiceUnavailable) as exc:
+            last_exc = exc
+            if delay is None:
+                break
+            print(
+                f"  WARN: transient error (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}), "
+                f"retrying in {delay}s — {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 def count_query(driver: Driver, cypher: str) -> int:
@@ -174,17 +190,18 @@ def migrate_schema(src: Driver, tgt: Driver, dry_run: bool) -> None:
             except Exception as exc:
                 print(f"    WARN skipping constraint: {exc} — {stmt[:80]}")
 
-    # Skip LOOKUP (auto-created) and FULLTEXT (complex to recreate safely)
+    # LOOKUP indexes are auto-created by Neo4j; all others are migrated
     indexes = run_query(
         src,
         "SHOW INDEXES YIELD type, createStatement "
-        "WHERE type IN ['RANGE', 'TEXT', 'POINT']",
+        "WHERE type IN ['RANGE', 'TEXT', 'POINT', 'VECTOR', 'FULLTEXT']",
     )
     print(f"  Indexes:     {len(indexes)}")
     for row in indexes:
         stmt = row["createStatement"]
         if "IF NOT EXISTS" not in stmt:
             stmt = stmt.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+            stmt = stmt.replace("CREATE FULLTEXT INDEX", "CREATE FULLTEXT INDEX IF NOT EXISTS", 1)
         if dry_run:
             print(f"    DRY: {stmt[:100]}")
         else:
@@ -238,12 +255,11 @@ def migrate_nodes(
                 pbar.update(skip)
 
         while True:
-            # SKIP/LIMIT is safe here because source is read-only during migration
             records = run_query(
                 src,
                 f"MATCH (n:`{label}`) "
                 "RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props "
-                f"SKIP {skip} LIMIT {batch_size}",
+                f"ORDER BY elementId(n) SKIP {skip} LIMIT {batch_size}",
             )
             if not records:
                 break
@@ -343,9 +359,9 @@ def migrate_relationships(
             records = run_query(
                 src,
                 f"MATCH (a)-[r:`{rel_type}`]->(b) "
-                "RETURN elementId(a) AS start_eid, elementId(b) AS end_eid, "
-                "       properties(r) AS props "
-                f"SKIP {skip} LIMIT {batch_size}",
+                "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
+                "       elementId(b) AS end_eid, properties(r) AS props "
+                f"ORDER BY elementId(r) SKIP {skip} LIMIT {batch_size}",
             )
             if not records:
                 break
@@ -444,6 +460,23 @@ def validate(src: Driver, tgt: Driver) -> bool:
             passed = False
         print(f"  {rel_type:<35} {src_cnt:>12,} {tgt_cnt:>12,} {'✓' if ok else '✗':>5}")
 
+    src_indexes = {
+        r["name"]: r["type"]
+        for r in run_query(src, "SHOW INDEXES YIELD name, type WHERE type <> 'LOOKUP'")
+    }
+    tgt_indexes = {
+        r["name"]
+        for r in run_query(tgt, "SHOW INDEXES YIELD name, type WHERE type <> 'LOOKUP'")
+    }
+
+    print(f"\n  {'Index':<35} {'Type':<12} {'OK?':>5}")
+    print(f"  {'-'*35} {'-'*12} {'-'*5}")
+    for name in sorted(src_indexes):
+        ok = name in tgt_indexes
+        if not ok:
+            passed = False
+        print(f"  {name:<35} {src_indexes[name]:<12} {'✓' if ok else '✗ MISSING':>5}")
+
     print(f"\n  Result: {'PASSED ✓' if passed else 'FAILED ✗'}")
     return passed
 
@@ -528,24 +561,24 @@ def main() -> None:
 
     start_time = time.time()
 
-    # Open connections
-    print("\n── Connecting ───────────────────────────────────────────────────")
-    src = open_driver(args.source_uri, args.source_user, args.source_password, "source")
-    tgt = open_driver(args.target_uri, args.target_user, args.target_password, "target")
-    id_map = open_id_map(args.id_map_db)
-
-    # Save checkpoint on Ctrl-C so --resume can pick up cleanly
-    def _handle_sigint(sig, frame):
-        print("\n\n  Interrupted — checkpoint saved. Re-run with --resume to continue.")
-        save_checkpoint(args.checkpoint_file, cp)
-        src.close()
-        tgt.close()
-        id_map.close()
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-
+    src = tgt = id_map = None
     try:
+        # Open connections
+        print("\n── Connecting ───────────────────────────────────────────────────")
+        src = open_driver(args.source_uri, args.source_user, args.source_password, "source")
+        tgt = open_driver(args.target_uri, args.target_user, args.target_password, "target")
+        id_map = open_id_map(args.id_map_db)
+
+        # Save checkpoint on Ctrl-C so --resume can pick up cleanly
+        def _handle_sigint(sig, frame):
+            print("\n\n  Interrupted — checkpoint saved. Re-run with --resume to continue.")
+            save_checkpoint(args.checkpoint_file, cp)
+            if src: src.close()
+            if tgt: tgt.close()
+            if id_map: id_map.close()
+            sys.exit(130)
+
+        signal.signal(signal.SIGINT, _handle_sigint)
         # ── Phase 0 ───────────────────────────────────────────────────────────
         counts = preflight(src, tgt, args.overwrite or args.dry_run)
 
@@ -598,9 +631,9 @@ def main() -> None:
         sys.exit(0 if passed else 2)
 
     finally:
-        src.close()
-        tgt.close()
-        id_map.close()
+        if src: src.close()
+        if tgt: tgt.close()
+        if id_map: id_map.close()
 
 
 if __name__ == "__main__":
