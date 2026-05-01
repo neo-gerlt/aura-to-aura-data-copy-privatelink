@@ -44,7 +44,13 @@ except ImportError:
     HAS_TQDM = False
 
 from neo4j import GraphDatabase, Driver
-from neo4j.exceptions import AuthError, ServiceUnavailable, TransientError
+from neo4j.exceptions import (
+    AuthError,
+    DatabaseUnavailable,
+    ServiceUnavailable,
+    SessionExpired,
+    TransientError,
+)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -157,13 +163,15 @@ def run_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> Lis
             with driver.session() as session:
                 result = session.run(cypher, params or {})
                 return [record.data() for record in result]
-        except (TransientError, ServiceUnavailable) as exc:
+        except (TransientError, ServiceUnavailable, SessionExpired, DatabaseUnavailable) as exc:
+            # SessionExpired covers mid-query bolt connection death (idle TCP timeouts on Aura,
+            # NLB resets, etc.); each retry opens a fresh session so this is safe to retry.
             last_exc = exc
             if delay is None:
                 break
             print(
                 f"  WARN: transient error (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}), "
-                f"retrying in {delay}s — {exc}",
+                f"retrying in {delay}s — {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             time.sleep(delay)
