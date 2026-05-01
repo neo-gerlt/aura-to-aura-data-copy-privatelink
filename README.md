@@ -44,7 +44,7 @@ All connection parameters can also be passed as CLI flags — run `--help` for t
 Verifies connectivity to both instances, counts nodes and relationships on the source, and checks whether the target is empty. Exits if the target has data and you haven't passed `--overwrite`.
 
 ### Phase 1 — Schema
-Runs `SHOW CONSTRAINTS` and `SHOW INDEXES` on the source, then replays those DDL statements on the target. This runs first so constraints are enforced as data arrives.
+Runs `SHOW CONSTRAINTS` and `SHOW INDEXES` on the source, then replays those DDL statements on the target. This runs first so constraints are enforced as data arrives. LOOKUP indexes are skipped (Neo4j auto-creates them); all other index types — RANGE, TEXT, POINT, VECTOR, and FULLTEXT — are migrated.
 
 ### Phase 2 — Nodes
 For each node label, pages through all nodes in batches of 5,000 using `SKIP/LIMIT`. Nodes are grouped by their **full label combination** (a node with `:Person:Employee` labels is created with both labels in one `CREATE` — no APOC required). Each batch is written to the target with `UNWIND ... CREATE`, and the mapping of `source elementId → target elementId` is stored in a SQLite database on disk.
@@ -55,7 +55,7 @@ The SQLite map handles multi-label nodes correctly: if a node has labels `[:Pers
 For each relationship type, pages through source relationships in batches. For each batch, resolves start and end node target IDs from SQLite, then creates the relationships on the target using those IDs.
 
 ### Phase 4 — Validation
-Counts nodes per label and relationships per type on both instances and prints a pass/fail table. Exits with code `2` if any counts mismatch.
+Counts nodes per label and relationships per type on both instances, and checks that all non-LOOKUP indexes from the source are present on the target. Prints a pass/fail table for each. Exits with code `2` if any counts or indexes mismatch.
 
 ---
 
