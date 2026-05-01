@@ -7,7 +7,7 @@ Instead of `neo4j-admin database upload` (which requires public traffic), this s
 Two modes are supported:
 
 - **`--mode=local`** — run the migration directly from the current machine. Use this when you are already inside the customer VPC (e.g. on a bastion or existing EC2).
-- **`--mode=ec2`** — the script provisions a fresh EC2 in the customer's VPC, runs the migration there, streams the output back, then terminates the instance automatically. Aura passwords are prompted interactively and stored temporarily in SSM Parameter Store — never written to disk or passed via user-data.
+- **`--mode=ec2`** — the script provisions a fresh EC2 in the customer's VPC, embeds itself onto the instance via base64 (no GitHub fetch — what runs is exactly the local code), runs the migration there, streams the output back, then terminates the instance automatically. Aura passwords are prompted interactively and stored temporarily in SSM Parameter Store as `SecureString`. They are never written to disk, never passed via user-data, and never appear in process argv on the EC2 — they are pulled from SSM into env vars right before invoking the migration.
 
 ---
 
@@ -51,7 +51,12 @@ python3 aura_to_aura_migration.py --mode=ec2 \
   --instance-profile=arn:aws:iam::123456789012:instance-profile/aura-migration
 ```
 
-Aura passwords are prompted interactively. The instance profile must allow `ssm:GetParameter` on `/aura-migration/*` and `ssm:SendCommand`.
+Aura passwords are prompted interactively.
+
+**Required IAM:**
+
+- The **invoking machine** (where you run `--mode=ec2`) needs `ec2:RunInstances`, `ec2:TerminateInstances`, `ec2:DescribeInstances`, `ssm:PutParameter` + `ssm:DeleteParameter` on `/aura-migration/*`, `ssm:SendCommand`, and `ssm:GetCommandInvocation`.
+- The **instance profile** (used by the migration EC2 itself) needs only `ssm:GetParameter` on `/aura-migration/*` and the AWS-managed `AmazonSSMManagedInstanceCore` policy so the SSM agent can register and execute commands.
 
 All connection parameters can also be passed as CLI flags — run `--help` for the full list.
 
