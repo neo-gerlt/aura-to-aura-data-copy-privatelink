@@ -25,8 +25,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -51,22 +53,41 @@ DEFAULT_CHECKPOINT_FILE = "migration_checkpoint.json"
 DEFAULT_ID_MAP_DB = "migration_ids.db"
 DEFAULT_USER = "neo4j"
 
+CHECKPOINT_VERSION = 2  # bumped when the checkpoint schema changes incompatibly
+
 _RETRY_DELAYS = (2, 5, 15)  # seconds between attempts on transient failures
+
+# Matches the leading "CREATE [<TYPE>] INDEX" form produced by SHOW INDEXES YIELD createStatement
+# in Neo4j 5.x. Used to inject "IF NOT EXISTS" idempotently across RANGE/TEXT/POINT/VECTOR/FULLTEXT.
+_INDEX_CREATE_RE = re.compile(
+    r"^(CREATE\s+(?:FULLTEXT|RANGE|TEXT|POINT|VECTOR|LOOKUP)?\s*INDEX)\s+(?!IF\s+NOT\s+EXISTS\b)",
+    re.IGNORECASE,
+)
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
 def load_checkpoint(path: str) -> dict:
     if Path(path).exists():
         with open(path) as f:
-            return json.load(f)
+            cp = json.load(f)
+        if cp.get("version") != CHECKPOINT_VERSION:
+            print(
+                f"  Incompatible checkpoint format (got version "
+                f"{cp.get('version', 'unversioned')!r}, expected {CHECKPOINT_VERSION}).\n"
+                f"  Delete {path} and the ID map and re-run without --resume to start fresh.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return cp
     return {
+        "version": CHECKPOINT_VERSION,
         "schema_done": False,
         "nodes_done": False,
         "rels_done": False,
         "labels_complete": [],
-        "label_offsets": {},
+        "label_last_eid": {},
         "rel_types_complete": [],
-        "rel_type_offsets": {},
+        "rel_type_last_eid": {},
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -144,8 +165,8 @@ def run_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> Lis
     raise last_exc  # type: ignore[misc]
 
 
-def count_query(driver: Driver, cypher: str) -> int:
-    return run_query(driver, cypher)[0]["cnt"]
+def count_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> int:
+    return run_query(driver, cypher, params)[0]["cnt"]
 
 
 # ── Phase 0: Pre-flight ────────────────────────────────────────────────────────
@@ -199,9 +220,10 @@ def migrate_schema(src: Driver, tgt: Driver, dry_run: bool) -> None:
     print(f"  Indexes:     {len(indexes)}")
     for row in indexes:
         stmt = row["createStatement"]
-        if "IF NOT EXISTS" not in stmt:
-            stmt = stmt.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
-            stmt = stmt.replace("CREATE FULLTEXT INDEX", "CREATE FULLTEXT INDEX IF NOT EXISTS", 1)
+        # Insert IF NOT EXISTS after the leading CREATE [<TYPE>] INDEX, regardless of type
+        # (RANGE/TEXT/POINT/VECTOR/FULLTEXT/LOOKUP). A naive substring replace misses the
+        # typed forms because they don't contain the literal "CREATE INDEX".
+        stmt = _INDEX_CREATE_RE.sub(r"\1 IF NOT EXISTS ", stmt, count=1)
         if dry_run:
             print(f"    DRY: {stmt[:100]}")
         else:
@@ -245,21 +267,29 @@ def migrate_nodes(
             print(f"  [{label}] already complete — skipping")
             continue
 
-        skip = cp["label_offsets"].get(label, 0)
+        # Cursor on elementId — avoids the O(n²) cost of SKIP/LIMIT on large labels.
+        # An empty string sorts before any non-empty elementId, giving a clean start cursor.
+        last_eid = cp["label_last_eid"].get(label, "")
         label_total = count_query(src, f"MATCH (n:`{label}`) RETURN count(n) AS cnt")
         label_written = 0
 
-        if skip > 0:
-            print(f"  [{label}] resuming at offset {skip:,}/{label_total:,}")
+        if last_eid:
+            done_so_far = count_query(
+                src,
+                f"MATCH (n:`{label}`) WHERE elementId(n) <= $last_eid RETURN count(n) AS cnt",
+                {"last_eid": last_eid},
+            )
+            print(f"  [{label}] resuming after {done_so_far:,}/{label_total:,}")
             if pbar:
-                pbar.update(skip)
+                pbar.update(done_so_far)
 
         while True:
             records = run_query(
                 src,
-                f"MATCH (n:`{label}`) "
+                f"MATCH (n:`{label}`) WHERE elementId(n) > $last_eid "
                 "RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props "
-                f"ORDER BY elementId(n) SKIP {skip} LIMIT {batch_size}",
+                f"ORDER BY elementId(n) LIMIT {batch_size}",
+                {"last_eid": last_eid},
             )
             if not records:
                 break
@@ -289,21 +319,21 @@ def migrate_nodes(
                     id_map_put(id_map, [(r["source_eid"], r["target_eid"]) for r in results])
 
             count = len(records)
-            skip += count
+            last_eid = records[-1]["eid"]
             label_written += len(new_records)
             migrated += len(new_records)
 
             if pbar:
                 pbar.update(len(new_records))
 
-            cp["label_offsets"][label] = skip
+            cp["label_last_eid"][label] = last_eid
             save_checkpoint(cp_path, cp)
 
             if count < batch_size:
                 break
 
         cp["labels_complete"].append(label)
-        cp["label_offsets"].pop(label, None)
+        cp["label_last_eid"].pop(label, None)
         save_checkpoint(cp_path, cp)
         print(f"  [{label}] {label_written:,} new nodes (label total on source: {label_total:,})")
 
@@ -346,22 +376,29 @@ def migrate_relationships(
             print(f"  [{rel_type}] already complete — skipping")
             continue
 
-        skip = cp["rel_type_offsets"].get(rel_type, 0)
+        last_eid = cp["rel_type_last_eid"].get(rel_type, "")
         rel_total = count_query(src, f"MATCH ()-[r:`{rel_type}`]->() RETURN count(r) AS cnt")
         rel_written = 0
 
-        if skip > 0:
-            print(f"  [{rel_type}] resuming at offset {skip:,}/{rel_total:,}")
+        if last_eid:
+            done_so_far = count_query(
+                src,
+                f"MATCH ()-[r:`{rel_type}`]->() WHERE elementId(r) <= $last_eid "
+                "RETURN count(r) AS cnt",
+                {"last_eid": last_eid},
+            )
+            print(f"  [{rel_type}] resuming after {done_so_far:,}/{rel_total:,}")
             if pbar:
-                pbar.update(skip)
+                pbar.update(done_so_far)
 
         while True:
             records = run_query(
                 src,
-                f"MATCH (a)-[r:`{rel_type}`]->(b) "
+                f"MATCH (a)-[r:`{rel_type}`]->(b) WHERE elementId(r) > $last_eid "
                 "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
                 "       elementId(b) AS end_eid, properties(r) AS props "
-                f"ORDER BY elementId(r) SKIP {skip} LIMIT {batch_size}",
+                f"ORDER BY elementId(r) LIMIT {batch_size}",
+                {"last_eid": last_eid},
             )
             if not records:
                 break
@@ -401,21 +438,21 @@ def migrate_relationships(
                 run_query(tgt, cypher, {"batch": batch_data})
 
             count = len(records)
-            skip += count
+            last_eid = records[-1]["r_eid"]
             rel_written += len(batch_data)
             migrated += len(batch_data)
 
             if pbar:
                 pbar.update(count)
 
-            cp["rel_type_offsets"][rel_type] = skip
+            cp["rel_type_last_eid"][rel_type] = last_eid
             save_checkpoint(cp_path, cp)
 
             if count < batch_size:
                 break
 
         cp["rel_types_complete"].append(rel_type)
-        cp["rel_type_offsets"].pop(rel_type, None)
+        cp["rel_type_last_eid"].pop(rel_type, None)
         save_checkpoint(cp_path, cp)
         print(f"  [{rel_type}] {rel_written:,} relationships written (source total: {rel_total:,})")
 
@@ -496,11 +533,17 @@ def _wait_for_ssm(ssm_client: Any, instance_id: str, timeout: int = 300) -> None
 
 
 def _stream_ssm_output(ssm_client: Any, instance_id: str, command_id: str) -> int:
+    time.sleep(5)  # give SSM time to register the invocation before first poll
     printed = 0
     while True:
-        result = ssm_client.get_command_invocation(
-            CommandId=command_id, InstanceId=instance_id
-        )
+        try:
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id
+            )
+        except ssm_client.exceptions.InvocationDoesNotExist:
+            time.sleep(5)
+            continue
+
         status = result["Status"]
         stdout = result.get("StandardOutputContent", "")
         stderr = result.get("StandardErrorContent", "")
@@ -519,10 +562,15 @@ def _stream_ssm_output(ssm_client: Any, instance_id: str, command_id: str) -> in
 
 def _build_passthrough_flags(args: argparse.Namespace) -> str:
     flags: List[str] = []
+    if args.dry_run:         flags.append("--dry-run")
     if args.overwrite:       flags.append("--overwrite")
     if args.resume:          flags.append("--resume")
     if args.skip_schema:     flags.append("--skip-schema")
     if args.skip_validation: flags.append("--skip-validation")
+    if args.source_user != DEFAULT_USER:
+        flags.append(f"--source-user {args.source_user}")
+    if args.target_user != DEFAULT_USER:
+        flags.append(f"--target-user {args.target_user}")
     if args.batch_size != DEFAULT_BATCH_SIZE:
         flags.append(f"--batch-size {args.batch_size}")
     return " ".join(flags)
@@ -596,15 +644,31 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
         print("  Ready.\n")
 
         passthrough = _build_passthrough_flags(args)
-        command_lines = [
+
+        # Embed the local script via base64 chunks instead of fetching from GitHub.
+        # This guarantees the EC2 runs exactly the local code (no "main vs working tree"
+        # foot-gun, no supply-chain risk from an unpinned raw URL).
+        script_bytes = Path(__file__).resolve().read_bytes()
+        script_b64 = base64.b64encode(script_bytes).decode()
+        chunk_size = 4096
+        chunks = [script_b64[i : i + chunk_size] for i in range(0, len(script_b64), chunk_size)]
+
+        command_lines: List[str] = [
             "#!/bin/bash",
             "set -euo pipefail",
             "pip3 install -q neo4j tqdm",
-            "curl -fsSL https://raw.githubusercontent.com/neo-gerlt/aura-to-aura-data-copy-pl/main/aura_to_aura_migration.py -o /tmp/migrate.py",
-            f'SOURCE_PW=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
-            f'TARGET_PW=$(aws ssm get-parameter --region {region} --name "{tgt_pw_path}" --with-decryption --query Parameter.Value --output text)',
-            f'python3 /tmp/migrate.py --mode=local --source-uri="{args.source_uri}" --source-password="$SOURCE_PW" --target-uri="{args.target_uri}" --target-password="$TARGET_PW" {passthrough}',
+            "rm -f /tmp/migrate.b64 /tmp/migrate.py",
         ]
+        for chunk in chunks:
+            command_lines.append(f'printf "%s" "{chunk}" >> /tmp/migrate.b64')
+        command_lines.extend([
+            "base64 -d /tmp/migrate.b64 > /tmp/migrate.py",
+            "rm -f /tmp/migrate.b64",
+            # Aura passwords go through env vars, not argv, so they don't leak via /proc.
+            f'export SOURCE_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
+            f'export TARGET_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{tgt_pw_path}" --with-decryption --query Parameter.Value --output text)',
+            f'python3 /tmp/migrate.py --mode=local --source-uri="{args.source_uri}" --target-uri="{args.target_uri}" {passthrough}',
+        ])
 
         cmd_resp = ssm_client.send_command(
             InstanceIds=[instance_id],

@@ -66,12 +66,12 @@ Verifies connectivity to both instances, counts nodes and relationships on the s
 Runs `SHOW CONSTRAINTS` and `SHOW INDEXES` on the source, then replays those DDL statements on the target. This runs first so constraints are enforced as data arrives. LOOKUP indexes are skipped (Neo4j auto-creates them); all other index types — RANGE, TEXT, POINT, VECTOR, and FULLTEXT — are migrated.
 
 ### Phase 2 — Nodes
-For each node label, pages through all nodes in batches of 5,000 using `SKIP/LIMIT`. Nodes are grouped by their **full label combination** (a node with `:Person:Employee` labels is created with both labels in one `CREATE` — no APOC required). Each batch is written to the target with `UNWIND ... CREATE`, and the mapping of `source elementId → target elementId` is stored in a SQLite database on disk.
+For each node label, pages through all nodes in batches of 5,000 using an **elementId cursor** (`WHERE elementId(n) > $last_eid ORDER BY elementId(n) LIMIT batch_size`). This avoids the O(n²) cost of `SKIP/LIMIT` on large labels. Nodes are grouped by their **full label combination** (a node with `:Person:Employee` labels is created with both labels in one `CREATE` — no APOC required). Each batch is written to the target with `UNWIND ... CREATE`, and the mapping of `source elementId → target elementId` is stored in a SQLite database on disk.
 
 The SQLite map handles multi-label nodes correctly: if a node has labels `[:Person, :Employee]`, it appears in both the `Person` pass and the `Employee` pass. The second time, the script sees it's already mapped and skips it.
 
 ### Phase 3 — Relationships
-For each relationship type, pages through source relationships in batches. For each batch, resolves start and end node target IDs from SQLite, then creates the relationships on the target using those IDs.
+For each relationship type, pages through source relationships in batches using the same elementId cursor pattern. For each batch, resolves start and end node target IDs from SQLite, then creates the relationships on the target using those IDs.
 
 ### Phase 4 — Validation
 Counts nodes per label and relationships per type on both instances, and checks that all non-LOOKUP indexes from the source are present on the target. Prints a pass/fail table for each. Exits with code `2` if any counts or indexes mismatch.
@@ -80,7 +80,15 @@ Counts nodes per label and relationships per type on both instances, and checks 
 
 ## Resume / crash recovery
 
-After every batch the script writes a **checkpoint JSON file** tracking which labels and relationship types are complete and the current `SKIP` offset. If the script is interrupted, re-run with `--resume` to continue from exactly where it left off. The SQLite ID map persists across restarts so the relationship phase can proceed after a node-phase crash.
+After every batch the script writes a **checkpoint JSON file** tracking which labels and relationship types are complete and the highest source `elementId` written so far. If the script is interrupted, re-run with `--resume` to continue from exactly where it left off. The SQLite ID map persists across restarts so the relationship phase can proceed after a node-phase crash.
+
+Transient connection errors (dropped Bolt connections, temporary Aura unavailability) are retried automatically up to 3 times with exponential backoff (2s, 5s, 15s) before the script fails. Most short network blips are handled transparently without needing a manual `--resume`.
+
+The checkpoint format is versioned. If the format changes incompatibly, `--resume` will refuse to load an old checkpoint and tell you to delete the JSON + ID map and start fresh.
+
+### Caveat: duplicate relationships on resume after a hard crash
+
+If the process dies in the small window **between** a relationship batch's write commit and the corresponding checkpoint save, `--resume` will re-run that batch and create duplicate relationships on the target (Neo4j allows multiple parallel rels of the same type between the same nodes). The window is sub-second, but it exists. If validation reports a target relationship count higher than the source, the safest fix is to drop the target database and re-run from scratch. This does not affect the node phase (the SQLite ID map dedups multi-label visits and post-crash retries by source elementId).
 
 ---
 
