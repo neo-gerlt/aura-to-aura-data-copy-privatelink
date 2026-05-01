@@ -481,6 +481,160 @@ def validate(src: Driver, tgt: Driver) -> bool:
     return passed
 
 
+# ── EC2 mode ──────────────────────────────────────────────────────────────────
+
+def _wait_for_ssm(ssm_client: Any, instance_id: str, timeout: int = 300) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = ssm_client.describe_instance_information(
+            Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+        )
+        if resp["InstanceInformationList"]:
+            return
+        time.sleep(10)
+    raise TimeoutError(f"SSM agent not ready on {instance_id} after {timeout}s")
+
+
+def _stream_ssm_output(ssm_client: Any, instance_id: str, command_id: str) -> int:
+    printed = 0
+    while True:
+        result = ssm_client.get_command_invocation(
+            CommandId=command_id, InstanceId=instance_id
+        )
+        status = result["Status"]
+        stdout = result.get("StandardOutputContent", "")
+        stderr = result.get("StandardErrorContent", "")
+
+        if len(stdout) > printed:
+            print(stdout[printed:], end="", flush=True)
+            printed = len(stdout)
+
+        if status in ("Success", "Failed", "Cancelled", "TimedOut"):
+            if stderr:
+                print(stderr, file=sys.stderr)
+            return result["ResponseCode"]
+
+        time.sleep(10)
+
+
+def _build_passthrough_flags(args: argparse.Namespace) -> str:
+    flags: List[str] = []
+    if args.overwrite:       flags.append("--overwrite")
+    if args.resume:          flags.append("--resume")
+    if args.skip_schema:     flags.append("--skip-schema")
+    if args.skip_validation: flags.append("--skip-validation")
+    if args.batch_size != DEFAULT_BATCH_SIZE:
+        flags.append(f"--batch-size {args.batch_size}")
+    return " ".join(flags)
+
+
+def run_ec2_mode(args: argparse.Namespace) -> None:
+    try:
+        import boto3
+        import getpass
+        import uuid
+    except ImportError:
+        print("EC2 mode requires boto3: pip install boto3", file=sys.stderr)
+        sys.exit(1)
+
+    print("═" * 62)
+    print("  Aura → Aura Migration  [EC2 mode]")
+    print(f"  Source  : {args.source_uri}")
+    print(f"  Target  : {args.target_uri}")
+    print(f"  Subnet  : {args.subnet_id}")
+    print(f"  Type    : {args.instance_type}")
+    print("═" * 62)
+
+    source_password = getpass.getpass("\nSource Aura password: ")
+    target_password = getpass.getpass("Target Aura password: ")
+
+    run_id = uuid.uuid4().hex[:8]
+    ssm_prefix = f"/aura-migration/{run_id}"
+    src_pw_path = f"{ssm_prefix}/source-password"
+    tgt_pw_path = f"{ssm_prefix}/target-password"
+
+    session = boto3.Session(region_name=args.aws_region or None)
+    region = session.region_name
+    ec2_client = session.client("ec2")
+    ssm_client = session.client("ssm")
+
+    print(f"\nStoring credentials in SSM ({ssm_prefix})...")
+    ssm_client.put_parameter(Name=src_pw_path, Value=source_password, Type="SecureString", Overwrite=True)
+    ssm_client.put_parameter(Name=tgt_pw_path, Value=target_password, Type="SecureString", Overwrite=True)
+
+    instance_id = None
+    exit_code = 1
+    try:
+        ami_id = ssm_client.get_parameter(
+            Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+        )["Parameter"]["Value"]
+
+        print(f"Launching {args.instance_type} (AMI: {ami_id})...")
+        instance_id = ec2_client.run_instances(
+            ImageId=ami_id,
+            InstanceType=args.instance_type,
+            MinCount=1,
+            MaxCount=1,
+            SubnetId=args.subnet_id,
+            SecurityGroupIds=[args.security_group_id],
+            IamInstanceProfile={"Arn": args.instance_profile},
+            TagSpecifications=[{
+                "ResourceType": "instance",
+                "Tags": [
+                    {"Key": "Name",                  "Value": f"aura-migration-{run_id}"},
+                    {"Key": "aura-migration-run-id", "Value": run_id},
+                ],
+            }],
+            InstanceInitiatedShutdownBehavior="terminate",
+        )["Instances"][0]["InstanceId"]
+        print(f"  Instance: {instance_id}")
+
+        print("  Waiting for instance running...")
+        ec2_client.get_waiter("instance_running").wait(InstanceIds=[instance_id])
+        print("  Waiting for SSM agent...")
+        _wait_for_ssm(ssm_client, instance_id)
+        print("  Ready.\n")
+
+        passthrough = _build_passthrough_flags(args)
+        command_lines = [
+            "#!/bin/bash",
+            "set -euo pipefail",
+            "pip3 install -q neo4j tqdm",
+            "curl -fsSL https://raw.githubusercontent.com/neo-gerlt/aura-to-aura-data-copy-pl/main/aura_to_aura_migration.py -o /tmp/migrate.py",
+            f'SOURCE_PW=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
+            f'TARGET_PW=$(aws ssm get-parameter --region {region} --name "{tgt_pw_path}" --with-decryption --query Parameter.Value --output text)',
+            f'python3 /tmp/migrate.py --mode=local --source-uri="{args.source_uri}" --source-password="$SOURCE_PW" --target-uri="{args.target_uri}" --target-password="$TARGET_PW" {passthrough}',
+        ]
+
+        cmd_resp = ssm_client.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": command_lines},
+            TimeoutSeconds=7200,
+        )
+        command_id = cmd_resp["Command"]["CommandId"]
+        print(f"SSM command: {command_id}\n{'─' * 62}")
+
+        exit_code = _stream_ssm_output(ssm_client, instance_id, command_id)
+
+    finally:
+        print("\n── Cleanup ──────────────────────────────────────────────────────")
+        for path in (src_pw_path, tgt_pw_path):
+            try:
+                ssm_client.delete_parameter(Name=path)
+            except Exception as exc:
+                print(f"  WARN: could not delete {path}: {exc}", file=sys.stderr)
+        print(f"  SSM parameters deleted ({ssm_prefix})")
+        if instance_id:
+            try:
+                ec2_client.terminate_instances(InstanceIds=[instance_id])
+                print(f"  Terminated {instance_id}")
+            except Exception as exc:
+                print(f"  WARN: could not terminate {instance_id}: {exc}", file=sys.stderr)
+
+    sys.exit(exit_code)
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -503,6 +657,8 @@ def parse_args() -> argparse.Namespace:
                       metavar="PW",        help="Target password (TARGET_AURA_PASSWORD)")
 
     beh = p.add_argument_group("Behavior")
+    beh.add_argument("--mode",             choices=["local", "ec2"], default="local",
+                     help="Run locally or provision an EC2 in the customer VPC (default: local)")
     beh.add_argument("--batch-size",       type=int, default=DEFAULT_BATCH_SIZE,
                      help=f"Nodes/rels per transaction (default: {DEFAULT_BATCH_SIZE})")
     beh.add_argument("--overwrite",        action="store_true",
@@ -522,6 +678,18 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--id-map-db",        default=DEFAULT_ID_MAP_DB,
                      help=f"SQLite ID map path (default: {DEFAULT_ID_MAP_DB})")
 
+    ec2 = p.add_argument_group("EC2 mode (required when --mode=ec2)")
+    ec2.add_argument("--subnet-id",         default=os.environ.get("AWS_SUBNET_ID"),
+                     help="Subnet ID for the migration EC2 (AWS_SUBNET_ID)")
+    ec2.add_argument("--security-group-id", default=os.environ.get("AWS_SECURITY_GROUP_ID"),
+                     help="Security group ID — must allow outbound 7687 (AWS_SECURITY_GROUP_ID)")
+    ec2.add_argument("--instance-profile",  default=os.environ.get("AWS_INSTANCE_PROFILE"),
+                     help="IAM instance profile ARN — needs ssm:GetParameter (AWS_INSTANCE_PROFILE)")
+    ec2.add_argument("--instance-type",     default="t3.medium",
+                     help="EC2 instance type (default: t3.medium)")
+    ec2.add_argument("--aws-region",        default=os.environ.get("AWS_DEFAULT_REGION"),
+                     help="AWS region (default: AWS_DEFAULT_REGION or boto3 default)")
+
     return p.parse_args()
 
 
@@ -530,15 +698,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Validate required credentials
+    # Validate required arguments
     missing = []
-    if not args.source_uri:      missing.append("--source-uri / SOURCE_AURA_URI")
-    if not args.source_password: missing.append("--source-password / SOURCE_AURA_PASSWORD")
-    if not args.target_uri:      missing.append("--target-uri / TARGET_AURA_URI")
-    if not args.target_password: missing.append("--target-password / TARGET_AURA_PASSWORD")
+    if not args.source_uri: missing.append("--source-uri / SOURCE_AURA_URI")
+    if not args.target_uri: missing.append("--target-uri / TARGET_AURA_URI")
+    if args.mode == "local":
+        if not args.source_password: missing.append("--source-password / SOURCE_AURA_PASSWORD")
+        if not args.target_password: missing.append("--target-password / TARGET_AURA_PASSWORD")
     if missing:
         print("Missing required arguments:\n  " + "\n  ".join(missing), file=sys.stderr)
         sys.exit(1)
+
+    if args.mode == "ec2":
+        ec2_missing = []
+        if not args.subnet_id:         ec2_missing.append("--subnet-id / AWS_SUBNET_ID")
+        if not args.security_group_id: ec2_missing.append("--security-group-id / AWS_SECURITY_GROUP_ID")
+        if not args.instance_profile:  ec2_missing.append("--instance-profile / AWS_INSTANCE_PROFILE")
+        if ec2_missing:
+            print("EC2 mode requires:\n  " + "\n  ".join(ec2_missing), file=sys.stderr)
+            sys.exit(1)
+        run_ec2_mode(args)
+        return
 
     # Checkpoint guard
     if Path(args.checkpoint_file).exists() and not args.resume and not args.dry_run:
