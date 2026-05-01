@@ -839,7 +839,8 @@ def main() -> None:
 
         signal.signal(signal.SIGINT, _handle_sigint)
         # ── Phase 0 ───────────────────────────────────────────────────────────
-        counts = preflight(src, tgt, args.overwrite or args.dry_run)
+        # --resume implies the target is expected to have prior-run data.
+        counts = preflight(src, tgt, args.overwrite or args.dry_run or args.resume)
 
         if args.dry_run:
             print("\n  Dry run complete — no data written.")
