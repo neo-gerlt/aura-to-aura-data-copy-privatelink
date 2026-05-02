@@ -54,7 +54,7 @@ from neo4j.exceptions import (
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-DEFAULT_BATCH_SIZE = 5000
+DEFAULT_BATCH_SIZE = 10000  # tuned from a real Aura-to-Aura run; see README "Performance"
 DEFAULT_CHECKPOINT_FILE = "migration_checkpoint.json"
 DEFAULT_ID_MAP_DB = "migration_ids.db"
 DEFAULT_USER = "neo4j"
@@ -228,11 +228,14 @@ def migrate_schema(src: Driver, tgt: Driver, dry_run: bool) -> None:
             except Exception as exc:
                 print(f"    WARN skipping constraint: {exc} — {stmt[:80]}")
 
-    # LOOKUP indexes are auto-created by Neo4j; all others are migrated
+    # LOOKUP indexes are auto-created by Neo4j; constraint backing-indexes are
+    # auto-created by their owning constraint (filtering them avoids the
+    # "EquivalentSchemaRuleAlreadyExists" warnings we'd otherwise see).
     indexes = run_query(
         src,
-        "SHOW INDEXES YIELD type, createStatement "
-        "WHERE type IN ['RANGE', 'TEXT', 'POINT', 'VECTOR', 'FULLTEXT']",
+        "SHOW INDEXES YIELD type, createStatement, owningConstraint "
+        "WHERE type IN ['RANGE', 'TEXT', 'POINT', 'VECTOR', 'FULLTEXT'] "
+        "AND owningConstraint IS NULL",
     )
     print(f"  Indexes:     {len(indexes)}")
     for row in indexes:

@@ -107,7 +107,7 @@ If the process dies in the small window **between** a relationship batch's write
 | `--overwrite` | Proceed into a non-empty target |
 | `--skip-schema` | Skip constraint/index migration |
 | `--skip-validation` | Skip post-migration count comparison |
-| `--batch-size N` | Rows per transaction (default: 5,000) |
+| `--batch-size N` | Rows per transaction (default: 10,000) |
 
 **EC2 mode flags** (required when `--mode=ec2`):
 
@@ -118,6 +118,23 @@ If the process dies in the small window **between** a relationship batch's write
 | `--instance-profile` | `AWS_INSTANCE_PROFILE` | IAM instance profile ARN |
 | `--instance-type` | — | EC2 instance type (default: `t3.medium`) |
 | `--aws-region` | `AWS_DEFAULT_REGION` | AWS region |
+
+---
+
+## Performance
+
+Numbers from a real Aura-to-Aura run on a 4.68M-node / 10.08M-rel dataset (no Private Link, both instances in the same AWS region):
+
+- **Phase 2 (nodes):** ~3,000–3,700 nodes/sec sustained at the default batch size.
+- **Phase 3 (relationships):** ~800–1,100 rels/sec at `--batch-size 5000`; ~3,000 rels/sec at `--batch-size 20000` early on. Each relationship write is ~3× the per-row cost of a node write because it does two `MATCH`-by-elementId lookups plus a `CREATE` per rel; bigger batches amortize the per-transaction round-trip. The default of `10,000` is a balance between throughput and per-transaction load.
+
+**Pace degradation in long Phase 3 runs.** In the same test, the rate started at ~3,000 rels/sec and degraded to ~50 rels/sec in the final 5–10% of CHATTER (the largest rel type), eventually triggering sustained `SessionExpired` events on the source bolt session. This is consistent with the source Aura instance being under sustained read pressure. Mitigations the script already applies:
+
+- Cursor-based pagination (no `SKIP/LIMIT`), so source-side cost stays linear.
+- Retry budget of 6 attempts with exponential backoff up to 2 minutes (~3.5 min total window) on `TransientError`, `ServiceUnavailable`, `SessionExpired`, and `DatabaseUnavailable`.
+- Per-batch checkpointing so `--resume` always picks up cleanly.
+
+If you observe sustained slowdowns in Phase 3, dropping `--batch-size` (e.g. to 5,000) reduces per-transaction load on the source and often recovers the rate. Resume with the smaller batch size — the cursor position is preserved.
 
 ---
 
@@ -135,7 +152,7 @@ After a successful run, the working directory will contain `migration_checkpoint
   Source : neo4j+s://xxxx.databases.neo4j.io
   Target : neo4j+s://yyyy.databases.neo4j.io
   Mode   : LIVE
-  Batch  : 5,000 rows/tx
+  Batch  : 10,000 rows/tx
 ══════════════════════════════════════════════════════════════
 
 ── Connecting ───────────────────────────────────────────────────
