@@ -61,7 +61,9 @@ DEFAULT_USER = "neo4j"
 
 CHECKPOINT_VERSION = 2  # bumped when the checkpoint schema changes incompatibly
 
-_RETRY_DELAYS = (2, 5, 15)  # seconds between attempts on transient failures
+_RETRY_DELAYS = (2, 5, 15, 30, 60, 120)  # seconds between attempts on transient failures
+# Total retry window: ~3.5 min. Sized for Aura connection hiccups that can last
+# tens of seconds during sustained load (observed in real test runs).
 
 # Matches the leading "CREATE [<TYPE>] INDEX" form produced by SHOW INDEXES YIELD createStatement
 # in Neo4j 5.x. Used to inject "IF NOT EXISTS" idempotently across RANGE/TEXT/POINT/VECTOR/FULLTEXT.
