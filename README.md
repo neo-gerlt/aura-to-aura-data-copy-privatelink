@@ -237,7 +237,8 @@ If the process dies in the small window **between** a relationship batch's write
 | `--overwrite` | Proceed into a non-empty target |
 | `--skip-schema` | Skip constraint/index migration |
 | `--skip-validation` | Skip post-migration count comparison |
-| `--batch-size N` | Rows per transaction (default: 10,000) |
+| `--batch-size N` | With auto-tune ON (default), the **initial bootstrap value** when explicitly set; the loop adapts from there. With auto-tune OFF, a **fixed batch size**. (default: 10,000) |
+| `--auto-tune-batch-size` / `--no-auto-tune-batch-size` | Adapt batch size at runtime based on per-batch wall-time, OOMs, and throughput plateau. Default: ON. Disable for benchmarks where reproducibility matters more than throughput. See [Adaptive Batch Sizing](#adaptive-batch-sizing). |
 
 **EC2 mode flags** (required when `--mode=ec2`):
 
@@ -248,6 +249,69 @@ If the process dies in the small window **between** a relationship batch's write
 | `--instance-profile` | `AWS_INSTANCE_PROFILE` | IAM instance profile ARN |
 | `--instance-type` | — | EC2 instance type (default: `t3.medium`) |
 | `--aws-region` | `AWS_DEFAULT_REGION` | AWS region |
+
+---
+
+## Adaptive Batch Sizing
+
+When `--auto-tune-batch-size` is on (the default), the script picks a per-label / per-rel-type batch size at runtime instead of using a single global `--batch-size`. Same code, no flag changes — runs on a 4 GB Aura tier and a 64 GB tier and discovers the right ceiling for each from observed signals.
+
+### What it does
+
+Two-level design:
+
+1. **Bootstrap pick (initial batch only)** — based on the label / rel-type's total row count from Phase 0:
+
+   | Total rows | Initial batch |
+   |---|---|
+   | < 5,000 | total (one shot) |
+   | < 100,000 | 5,000 |
+   | < 1,000,000 | 10,000 |
+   | ≥ 1,000,000 | 20,000 |
+
+   This is a starting hint only — from batch 2 onward, the adaptive loop is the source of truth. An explicit `--batch-size N` overrides the bootstrap.
+
+2. **Adaptive loop** — three runtime signals drive it:
+
+   - **Wall-time slow/fast.** A batch is "slow" if it took > 5 s, "fast" if < 1 s. After 3 consecutive slow batches → halve. After 5 consecutive fast batches → double.
+   - **`MemoryPoolOutOfMemoryError`** — sticky hard ceiling. The OOMing size halves and locks: doubling can never bring the loop back to a size that's known to OOM. Sub-divides the failed batch and retries at the new size; consecutive OOMs at retry are not coalesced — each is a real signal.
+   - **Throughput plateau.** A double must improve rows/sec by ≥ 10% to count as progress. If it doesn't, doubling stops for the rest of the label/rel-type — the bottleneck has shifted from batch overhead to something else (network, target write throughput, driver serialization).
+
+   The loop also tracks a **soft ceiling** (the highest size that has produced fast batches) so a transient slow window can halve, then climb back up to known-good without going through the doubling-growth path. This is what makes the algorithm robust against single GC pauses without permanent regression.
+
+### What you'll see
+
+Heartbeat lines (every 20 s, same cadence as today) gain four auto-tune fields:
+
+```
+[CHATTER] 8,450,000/10,018,281 (84.4%) rate 5,890/s elapsed 1,434s ETA 266s last_batch_rate=12,300/s batch=20,000 ceiling=40,000 soft_ceiling=20,000
+```
+
+| Field | Meaning |
+|---|---|
+| `rate` | **Cumulative** rows/sec since the label/rel-type started (unchanged from before) |
+| `last_batch_rate` | Rows/sec of the most recent completed batch (auto-tune's per-batch view) |
+| `batch` | Current batch size the loop has settled on |
+| `ceiling` | Hard upper bound (`∞` if never tripped); set by OOM or repeated steady-state slow |
+| `soft_ceiling` | Highest size that has produced fast batches; if `batch < soft_ceiling`, the loop is in slow-recovery |
+
+State-transition events (halve, double, OOM, plateau-lock) emit their own stderr WARN lines so transitions are easy to grep for in long-run logs.
+
+### Failure modes
+
+If the target instance can't sustain even `MIN_BATCH = 1,000` rows for some label, the script raises `InstanceTooSmall`, prints an operator-friendly message, preserves the checkpoint, and exits with code **3** (distinct from generic exit 1, so EC2-mode wrappers can recognize "this is a tier mismatch, not a transient"). Re-run with `--resume` after upgrading the target Aura tier.
+
+### When to disable
+
+Pass `--no-auto-tune-batch-size` to disable. The static path is byte-identical to pre-auto-tune behavior. Use it for:
+
+- **Benchmark reproducibility** — fixed batches are required to compare runs.
+- **Diagnosing whether auto-tune is implicated** in a regression.
+- **Tier-cap regression tests** — pinning a known-too-large batch to confirm the OOM repro on a tier.
+
+### Resume behavior
+
+Auto-tune state lives in memory only — it is NOT included in the checkpoint JSON. After `--resume`, the loop bootstraps fresh and re-discovers ceilings on the first few batches per label/rel-type. The cost is one OOM + halve per type that previously hit OOM; on a multi-million-row label this is seconds, not minutes. The banner prints a one-liner reminder when `--resume` is used.
 
 ---
 
@@ -273,9 +337,9 @@ Numbers from a 4.68M-node / 10.08M-rel migration run with both Aura instances re
 
 - **Source Aura tier upgrade** (more CPU/memory) directly raises the per-query throughput ceiling. Going from 4 GB to 16+ GB will likely 2-4× the rels/sec by itself.
 - **Parallel relationship workers** (range-partition the elementId space across N concurrent readers) — see follow-up task `tsk-20260502-aura-migration-parallel-rels`. Expected ~1.5–2× throughput from N=2 since both source and target have headroom for concurrent transactions.
-- **Adaptive per-rel-type batch sizing** (see `tsk-20260502-aura-migration-auto-tune-batch`) — small rel types can use larger batches; large rel types should stay smaller to avoid target tx-memory OOM.
+- **Adaptive per-rel-type batch sizing** — implemented; on by default (`--auto-tune-batch-size`). The script picks per-rel-type batch sizes at runtime and discovers the target's tx-memory ceiling from observed `MemoryPoolOutOfMemoryError` rather than relying on operator guesswork. See [Adaptive Batch Sizing](#adaptive-batch-sizing) above.
 
-**`--batch-size` ceiling on small tiers:** observed `MemoryPoolOutOfMemoryError` at `--batch-size 40000` for CHATTER on a 4 GB target's 1.3 GiB tx-memory cap. Each row's `MATCH (a) WHERE elementId(a) = ... MATCH (b) WHERE elementId(b) = ... CREATE (a)-[r]->(b)` retains node references in transaction memory; 40,000 × ~33 KB/row ≈ 1.3 GiB. On a 4 GB target, `--batch-size 20000` is the practical safe maximum for heavy rel types; bigger tiers will tolerate larger batches. **The documented default of 10,000 stays safe across all tiers and rel-fan-out patterns** and is the recommended starting point for any migration where the customer's Aura tier is unknown.
+**`--batch-size` ceiling on small tiers:** observed `MemoryPoolOutOfMemoryError` at `--batch-size 40000` for CHATTER on a 4 GB target's 1.3 GiB tx-memory cap. Each row's `MATCH (a) WHERE elementId(a) = ... MATCH (b) WHERE elementId(b) = ... CREATE (a)-[r]->(b)` retains node references in transaction memory; 40,000 × ~33 KB/row ≈ 1.3 GiB. With auto-tune ON (default), the script discovers this ceiling at runtime — on a 4 GB target it will OOM once at 40K, lock the ceiling at 20K, and run cleanly thereafter. With auto-tune OFF, **`--batch-size 10000` stays safe across all tiers** and is the recommended fixed value when reproducibility matters more than throughput.
 
 **Pace degradation in long Phase 3 runs.** In the same test, the rate started at ~3,000 rels/sec and degraded to ~50 rels/sec in the final 5–10% of CHATTER (the largest rel type), eventually triggering sustained `SessionExpired` events on the source bolt session. This is consistent with the source Aura instance being under sustained read pressure. Mitigations the script already applies:
 
@@ -301,7 +365,7 @@ After a successful run, the working directory will contain `migration_checkpoint
   Source : neo4j+s://xxxx.databases.neo4j.io
   Target : neo4j+s://yyyy.databases.neo4j.io
   Mode   : LIVE
-  Batch  : 10,000 rows/tx
+  Batch  : auto-tune ON (bootstrap from per-label counts)
 ══════════════════════════════════════════════════════════════
 
 ── Connecting ───────────────────────────────────────────────────

@@ -83,14 +83,65 @@ _CONSTRAINT_FOR_RE = re.compile(r"\sFOR\s", re.IGNORECASE)
 HEARTBEAT_INTERVAL_SEC = 20.0
 
 
+# ── Auto-tune (self-tuning batch sizing) ───────────────────────────────────────
+# See contexts/projects/aura-to-aura-data-copy-pl/tsk-20260502-aura-migration-auto-tune-batch.md
+# in the CommandCenter repo for the full design.
+
+# Server status codes that surface as OOM-shaped TransientError. The canonical
+# list lives at https://neo4j.com/docs/status-codes/current/ and can shift across
+# Neo4j server versions. A TransientError whose .code contains "OutOfMemory" but
+# is NOT in this set emits a stderr warning so we surface drift early.
+OOM_CODES = frozenset({
+    "Neo.TransientError.General.MemoryPoolOutOfMemoryError",
+    "Neo.TransientError.General.OutOfMemoryError",
+    "Neo.TransientError.General.TransactionOutOfMemoryError",
+})
+
+# Auto-tune algorithm constants. Internal-only — promoted to CLI flags only if the
+# test matrix shows we need them.
+MIN_BATCH = 1_000          # floor — fail loud rather than crawl below this
+SLOW_SEC = 5.0             # batches > this are "slow"
+FAST_SEC = 1.0             # batches < this are "fast"
+SLOW_THRESHOLD = 3         # halve after N consecutive slow batches
+FAST_THRESHOLD = 5         # double after N consecutive fast batches
+PLATEAU_RATIO = 1.10       # double must improve rows/sec by ≥10% to count as progress
+
+
+class InstanceTooSmall(Exception):
+    """Raised when an OOM forces the auto-tune ceiling below MIN_BATCH for a label.
+
+    Caught at top-level main() for an operator-friendly message and a distinct
+    exit code. Implies the target Aura instance can't sustain even MIN_BATCH-row
+    batches for this label/rel-type — the user should upgrade the tier.
+    """
+
+    def __init__(self, label: str, oom_size: int, original_exc: Exception) -> None:
+        self.label = label
+        self.oom_size = oom_size
+        self.original_exc = original_exc
+        super().__init__(
+            f"Auto-tune cannot proceed: {label!r} OOM'd at batch_size={oom_size:,} "
+            f"and halving would drop below MIN_BATCH={MIN_BATCH:,}. "
+            f"The target instance is too small for this dataset — upgrade the tier "
+            f"and re-run with --resume.\n  Original error: {original_exc}"
+        )
+
+
 class _Heartbeat:
-    def __init__(self, label: str, total: int, interval_sec: float = HEARTBEAT_INTERVAL_SEC):
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        interval_sec: float = HEARTBEAT_INTERVAL_SEC,
+        state: Optional["_AutoTuneState"] = None,
+    ):
         self.label = label
         self.total = total
         self.interval = interval_sec
         self.start = time.time()
         self.last_emit = self.start
         self.done = 0
+        self.state = state
 
     def tick(self, count: int) -> None:
         self.done += count
@@ -102,12 +153,137 @@ class _Heartbeat:
         pct = (self.done / self.total * 100) if self.total else 0
         remaining = max(self.total - self.done, 0)
         eta = remaining / rate if rate > 0 else 0
-        print(
+        line = (
             f"  [{self.label}] {self.done:,}/{self.total:,} ({pct:.1f}%) "
-            f"rate {rate:,.0f}/s elapsed {elapsed:.0f}s ETA {eta:.0f}s",
-            flush=True,
+            f"rate {rate:,.0f}/s elapsed {elapsed:.0f}s ETA {eta:.0f}s"
         )
+        if self.state is not None:
+            f = self.state.heartbeat_fields()
+            ceiling_str = "∞" if f["discovered_ceiling"] is None else f"{f['discovered_ceiling']:,}"
+            last_rate = f"{f['last_batch_rate']:,.0f}/s" if f["last_batch_rate"] else "—"
+            line += (
+                f" last_batch_rate={last_rate}"
+                f" batch={f['current_batch_size']:,}"
+                f" ceiling={ceiling_str}"
+                f" soft_ceiling={f['soft_ceiling']:,}"
+            )
+        print(line, flush=True)
         self.last_emit = now
+
+
+def _bootstrap_initial(total_rows: int) -> int:
+    """Initial batch size from total row count. Bootstrap heuristic only —
+    overridden by the adaptive loop within ~5–10 batches."""
+    if total_rows <= 0:
+        return MIN_BATCH
+    if total_rows < 5_000:
+        return total_rows  # one-shot for tiny labels
+    if total_rows < 100_000:
+        return 5_000
+    if total_rows < 1_000_000:
+        return 10_000
+    return 20_000
+
+
+class _AutoTuneState:
+    """Per-label/per-rel-type adaptive batch sizing state.
+
+    See `tsk-20260502-aura-migration-auto-tune-batch.md` for the full algorithm
+    (decisions table, edge cases, retry contract). Public surface:
+      next_size()                 -> batch size to use for the next iteration
+      record_batch(rows, elapsed) -> tick fast/slow counters; may halve/double
+      record_oom(size, exc)       -> lower hard ceiling stickily; may raise InstanceTooSmall
+      heartbeat_fields()          -> snapshot for _Heartbeat to surface
+    """
+
+    def __init__(self, label: str, total_rows: int, initial: Optional[int] = None) -> None:
+        self.label = label
+        self.current = initial if initial is not None else _bootstrap_initial(total_rows)
+        self.ceiling: float = float("inf")
+        self.soft_ceiling = self.current
+        self.consec_slow = 0
+        self.consec_fast = 0
+        self.last_doubled_rate: Optional[float] = None
+        self.last_slow_size: Optional[int] = None
+        self.plateau_locked = False
+        self.last_batch_rate: Optional[float] = None
+
+    def next_size(self) -> int:
+        return self.current
+
+    def record_oom(self, size: int, exc: Exception) -> None:
+        new_ceiling = size // 2
+        if new_ceiling < MIN_BATCH:
+            raise InstanceTooSmall(self.label, size, exc)
+        self.ceiling = new_ceiling
+        self.soft_ceiling = min(self.soft_ceiling, new_ceiling)
+        self.current = int(self.ceiling)
+        self.consec_slow = 0
+        self.consec_fast = 0
+        self.plateau_locked = True
+
+    def record_batch(self, rows: int, elapsed: float) -> None:
+        if rows <= 0 or elapsed <= 0:
+            return
+        rate = rows / elapsed
+        self.last_batch_rate = rate
+        size = self.current
+
+        if elapsed > SLOW_SEC:
+            self.consec_slow += 1
+            self.consec_fast = 0
+            if self.consec_slow >= SLOW_THRESHOLD:
+                # Steady-state slow detection: same size went slow twice → sticky ceiling.
+                if self.last_slow_size == size:
+                    self.ceiling = max(MIN_BATCH, size // 2)
+                    self.plateau_locked = True
+                self.last_slow_size = size
+                # Slow at-or-above soft_ceiling means soft_ceiling was claimed too high.
+                if size >= self.soft_ceiling:
+                    self.soft_ceiling = max(MIN_BATCH, size // 2)
+                self.current = max(MIN_BATCH, size // 2)
+                self.consec_slow = 0
+                # NOTE: slow-halve does NOT set plateau_locked. The recovery path
+                # in the FAST branch below will climb back up after the transient.
+        elif elapsed < FAST_SEC:
+            self.soft_ceiling = max(self.soft_ceiling, size)
+            self.consec_fast += 1
+            self.consec_slow = 0
+            if self.consec_fast >= FAST_THRESHOLD:
+                ceiling_int = None if self.ceiling == float("inf") else int(self.ceiling)
+                # Recovery path: jump back to soft_ceiling without going through doubling.
+                if size < self.soft_ceiling:
+                    target = self.soft_ceiling if ceiling_int is None else min(self.soft_ceiling, ceiling_int)
+                    self.current = target
+                    self.consec_fast = 0
+                    return
+                if self.plateau_locked:
+                    self.consec_fast = 0
+                    return
+                new_size = size * 2 if ceiling_int is None else min(size * 2, ceiling_int)
+                if new_size <= size:
+                    self.consec_fast = 0
+                    return
+                # Plateau check — single-sample today; median-of-3 deferred to v2.
+                if self.last_doubled_rate is not None:
+                    if rate < self.last_doubled_rate * PLATEAU_RATIO:
+                        self.plateau_locked = True
+                        self.consec_fast = 0
+                        return
+                self.last_doubled_rate = rate
+                self.current = new_size
+                self.consec_fast = 0
+        else:
+            self.consec_slow = 0
+            self.consec_fast = 0
+
+    def heartbeat_fields(self) -> Dict[str, Any]:
+        return {
+            "last_batch_rate": self.last_batch_rate,
+            "current_batch_size": self.current,
+            "discovered_ceiling": None if self.ceiling == float("inf") else int(self.ceiling),
+            "soft_ceiling": self.soft_ceiling,
+        }
 
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
@@ -231,6 +407,87 @@ def count_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> i
     return run_query(driver, cypher, params)[0]["cnt"]
 
 
+def _run_write_batch(
+    driver: Driver, cypher: str, params: Optional[Dict] = None
+) -> List[Dict[str, Any]]:
+    """Execute a single write batch. Differs from run_query by NOT silently
+    retrying OOM-coded TransientErrors — those propagate so the auto-tune
+    handler can react. Non-OOM transients still retry with the same backoff
+    schedule. See "Auto-tune Retry Contract" in the plan doc.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        try:
+            with driver.session() as session:
+                result = session.run(cypher, params or {})
+                return [record.data() for record in result]
+        except TransientError as exc:
+            if exc.code in OOM_CODES:
+                raise
+            if exc.code and "OutOfMemory" in exc.code:
+                print(
+                    f"  WARN: TransientError with OOM-shaped code {exc.code!r} not in OOM_CODES; "
+                    f"treating as non-OOM transient — consider updating OOM_CODES",
+                    file=sys.stderr,
+                )
+            last_exc = exc
+            if delay is None:
+                break
+            print(
+                f"  WARN: transient error (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}), "
+                f"retrying in {delay}s — {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except (ServiceUnavailable, SessionExpired, DatabaseUnavailable) as exc:
+            last_exc = exc
+            if delay is None:
+                break
+            print(
+                f"  WARN: connection error (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}), "
+                f"retrying in {delay}s — {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+def _write_with_oom_retry(
+    driver: Driver,
+    cypher: str,
+    batch_data: List[Dict[str, Any]],
+    state: _AutoTuneState,
+) -> Tuple[List[Dict[str, Any]], float, bool]:
+    """Write `batch_data`; on OOM, lower the auto-tune ceiling and sub-divide.
+
+    Returns (results, elapsed_sec, oom_occurred). Each OOM is a real signal —
+    consecutive OOMs at retry are NOT coalesced. Raises InstanceTooSmall if
+    halving would force the ceiling below MIN_BATCH.
+    """
+    if not batch_data:
+        return [], 0.0, False
+
+    t0 = time.time()
+    try:
+        results = _run_write_batch(driver, cypher, {"batch": batch_data})
+        return results, time.time() - t0, False
+    except TransientError as exc:
+        if exc.code in OOM_CODES:
+            elapsed_to_oom = time.time() - t0
+            print(
+                f"  auto-tune: OOM at batch={len(batch_data):,} "
+                f"(code={exc.code}) — lowering ceiling and sub-dividing",
+                file=sys.stderr,
+                flush=True,
+            )
+            state.record_oom(len(batch_data), exc)  # may raise InstanceTooSmall
+            mid = len(batch_data) // 2
+            r1, e1, _ = _write_with_oom_retry(driver, cypher, batch_data[:mid], state)
+            r2, e2, _ = _write_with_oom_retry(driver, cypher, batch_data[mid:], state)
+            return r1 + r2, elapsed_to_oom + e1 + e2, True
+        raise
+
+
 # ── Phase 0: Pre-flight ────────────────────────────────────────────────────────
 
 def preflight(src: Driver, tgt: Driver, overwrite: bool) -> Dict[str, int]:
@@ -317,6 +574,7 @@ def migrate_nodes(
     cp_path: str,
     batch_size: int,
     total_nodes: int,
+    auto_tune: bool = False,
 ) -> int:
     print("\n── Phase 2: Nodes ───────────────────────────────────────────────")
 
@@ -325,6 +583,10 @@ def migrate_nodes(
 
     migrated = 0
     pbar = tqdm(total=total_nodes, unit="nodes", disable=not sys.stdout.isatty()) if HAS_TQDM else None
+
+    # When auto-tune is on, an explicitly-passed --batch-size acts as the initial hint;
+    # default --batch-size lets the bootstrap heuristic pick a per-label initial.
+    autotune_initial = batch_size if (auto_tune and batch_size != DEFAULT_BATCH_SIZE) else None
 
     for label in labels:
         if label in cp["labels_complete"]:
@@ -339,7 +601,11 @@ def migrate_nodes(
         last_eid = cp["label_last_eid"].get(label, "")
         label_total = count_query(src, f"MATCH (n:`{label}`) RETURN count(n) AS cnt")
         label_written = 0
-        hb = _Heartbeat(label, label_total)
+
+        state: Optional[_AutoTuneState] = (
+            _AutoTuneState(label, label_total, initial=autotune_initial) if auto_tune else None
+        )
+        hb = _Heartbeat(label, label_total, state=state)
 
         if last_eid:
             done_so_far = count_query(
@@ -353,11 +619,12 @@ def migrate_nodes(
             hb.done = done_so_far
 
         while True:
+            current_limit = state.next_size() if state is not None else batch_size
             records = run_query(
                 src,
                 f"MATCH (n:`{label}`) WHERE elementId(n) > $last_eid "
                 "RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props "
-                f"ORDER BY elementId(n) LIMIT {batch_size}",
+                f"ORDER BY elementId(n) LIMIT {current_limit}",
                 {"last_eid": last_eid},
             )
             if not records:
@@ -366,6 +633,9 @@ def migrate_nodes(
             # Bulk-check which source eids are already in the map (multi-label dedup)
             known = id_map_get(id_map, [r["eid"] for r in records])
             new_records = [r for r in records if r["eid"] not in known]
+
+            iteration_t0 = time.time() if state is not None else None
+            iteration_oom = False
 
             if new_records:
                 # Group by full sorted label tuple → one CREATE per unique label combo
@@ -384,8 +654,15 @@ def migrate_nodes(
                         "RETURN row.source_eid AS source_eid, elementId(n) AS target_eid"
                     )
                     batch_data = [{"source_eid": r["eid"], "props": r["props"]} for r in group]
-                    results = run_query(tgt, cypher, {"batch": batch_data})
+                    if state is not None:
+                        results, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
+                        iteration_oom = iteration_oom or oom
+                    else:
+                        results = run_query(tgt, cypher, {"batch": batch_data})
                     id_map_put(id_map, [(r["source_eid"], r["target_eid"]) for r in results])
+
+            if state is not None and not iteration_oom and iteration_t0 is not None:
+                state.record_batch(len(new_records), time.time() - iteration_t0)
 
             count = len(records)
             last_eid = records[-1]["eid"]
@@ -399,7 +676,7 @@ def migrate_nodes(
             cp["label_last_eid"][label] = last_eid
             save_checkpoint(cp_path, cp)
 
-            if count < batch_size:
+            if count < current_limit:
                 break
 
         cp["labels_complete"].append(label)
@@ -426,6 +703,7 @@ def migrate_relationships(
     cp_path: str,
     batch_size: int,
     total_rels: int,
+    auto_tune: bool = False,
 ) -> int:
     print("\n── Phase 3: Relationships ───────────────────────────────────────")
 
@@ -438,6 +716,8 @@ def migrate_relationships(
     migrated = 0
     pbar = tqdm(total=total_rels, unit="rels", disable=not sys.stdout.isatty()) if HAS_TQDM else None
 
+    autotune_initial = batch_size if (auto_tune and batch_size != DEFAULT_BATCH_SIZE) else None
+
     for rel_type in rel_types:
         if rel_type in cp["rel_types_complete"]:
             already = count_query(src, f"MATCH ()-[r:`{rel_type}`]->() RETURN count(r) AS cnt")
@@ -449,7 +729,11 @@ def migrate_relationships(
         last_eid = cp["rel_type_last_eid"].get(rel_type, "")
         rel_total = count_query(src, f"MATCH ()-[r:`{rel_type}`]->() RETURN count(r) AS cnt")
         rel_written = 0
-        hb = _Heartbeat(rel_type, rel_total)
+
+        state: Optional[_AutoTuneState] = (
+            _AutoTuneState(rel_type, rel_total, initial=autotune_initial) if auto_tune else None
+        )
+        hb = _Heartbeat(rel_type, rel_total, state=state)
 
         if last_eid:
             done_so_far = count_query(
@@ -464,12 +748,13 @@ def migrate_relationships(
             hb.done = done_so_far
 
         while True:
+            current_limit = state.next_size() if state is not None else batch_size
             records = run_query(
                 src,
                 f"MATCH (a)-[r:`{rel_type}`]->(b) WHERE elementId(r) > $last_eid "
                 "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
                 "       elementId(b) AS end_eid, properties(r) AS props "
-                f"ORDER BY elementId(r) LIMIT {batch_size}",
+                f"ORDER BY elementId(r) LIMIT {current_limit}",
                 {"last_eid": last_eid},
             )
             if not records:
@@ -498,6 +783,9 @@ def migrate_relationships(
             if missing:
                 print(f"    WARN: {missing} relationships skipped (node not in ID map)")
 
+            iteration_t0 = time.time() if state is not None else None
+            iteration_oom = False
+
             if batch_data:
                 cypher = (
                     "UNWIND $batch AS row "
@@ -507,7 +795,14 @@ def migrate_relationships(
                     "SET r = row.props "
                     "RETURN count(r) AS created"
                 )
-                run_query(tgt, cypher, {"batch": batch_data})
+                if state is not None:
+                    _, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
+                    iteration_oom = oom
+                else:
+                    run_query(tgt, cypher, {"batch": batch_data})
+
+            if state is not None and not iteration_oom and iteration_t0 is not None:
+                state.record_batch(len(batch_data), time.time() - iteration_t0)
 
             count = len(records)
             last_eid = records[-1]["r_eid"]
@@ -521,7 +816,7 @@ def migrate_relationships(
             cp["rel_type_last_eid"][rel_type] = last_eid
             save_checkpoint(cp_path, cp)
 
-            if count < batch_size:
+            if count < current_limit:
                 break
 
         cp["rel_types_complete"].append(rel_type)
@@ -707,6 +1002,8 @@ def _build_passthrough_flags(args: argparse.Namespace) -> str:
         flags.append(f"--target-user {args.target_user}")
     if args.batch_size != DEFAULT_BATCH_SIZE:
         flags.append(f"--batch-size {args.batch_size}")
+    if not args.auto_tune_batch_size:
+        flags.append("--no-auto-tune-batch-size")
     return " ".join(flags)
 
 
@@ -874,7 +1171,14 @@ def parse_args() -> argparse.Namespace:
     beh.add_argument("--mode",             choices=["local", "ec2"], default="local",
                      help="Run locally or provision an EC2 in the customer VPC (default: local)")
     beh.add_argument("--batch-size",       type=int, default=DEFAULT_BATCH_SIZE,
-                     help=f"Nodes/rels per transaction (default: {DEFAULT_BATCH_SIZE})")
+                     help=f"Nodes/rels per transaction. With auto-tune ON (default), "
+                          f"acts as the initial bootstrap value when explicitly set. "
+                          f"With auto-tune OFF, acts as a fixed batch size. "
+                          f"(default: {DEFAULT_BATCH_SIZE})")
+    beh.add_argument("--auto-tune-batch-size", action=argparse.BooleanOptionalAction, default=True,
+                     help="Adapt batch size at runtime based on per-batch wall-time, "
+                          "OOMs, and throughput plateau (default: ON). "
+                          "Use --no-auto-tune-batch-size to disable and run with a fixed --batch-size.")
     beh.add_argument("--overwrite",        action="store_true",
                      help="Proceed even if target is not empty")
     beh.add_argument("--resume",           action="store_true",
@@ -950,7 +1254,15 @@ def main() -> None:
     print(f"  Source : {args.source_uri}")
     print(f"  Target : {args.target_uri}")
     print(f"  Mode   : {'DRY RUN (no writes)' if args.dry_run else 'LIVE'}")
-    print(f"  Batch  : {args.batch_size:,} rows/tx")
+    if args.auto_tune_batch_size:
+        if args.batch_size != DEFAULT_BATCH_SIZE:
+            print(f"  Batch  : auto-tune ON (initial hint: {args.batch_size:,} rows/tx)")
+        else:
+            print(f"  Batch  : auto-tune ON (bootstrap from per-label counts)")
+    else:
+        print(f"  Batch  : {args.batch_size:,} rows/tx (auto-tune OFF)")
+    if args.resume:
+        print(f"  Resume : auto-tune state not persisted across runs; will re-discover ceilings")
     print("═" * 62)
 
     start_time = time.time()
@@ -998,6 +1310,7 @@ def main() -> None:
             migrate_nodes(
                 src, tgt, id_map, cp, args.checkpoint_file,
                 args.batch_size, counts["src_nodes"],
+                auto_tune=args.auto_tune_batch_size,
             )
 
         # ── Phase 3 ───────────────────────────────────────────────────────────
@@ -1007,6 +1320,7 @@ def main() -> None:
             migrate_relationships(
                 src, tgt, id_map, cp, args.checkpoint_file,
                 args.batch_size, counts["src_rels"],
+                auto_tune=args.auto_tune_batch_size,
             )
 
         # ── Phase 4 ───────────────────────────────────────────────────────────
@@ -1025,6 +1339,13 @@ def main() -> None:
 
         sys.exit(0 if passed else 2)
 
+    except InstanceTooSmall as exc:
+        print(f"\n{'═' * 62}", file=sys.stderr)
+        print(f"  ✗ {exc}", file=sys.stderr)
+        print(f"  Checkpoint preserved at: {args.checkpoint_file}", file=sys.stderr)
+        print(f"  Re-run with --resume after upgrading the target Aura tier.", file=sys.stderr)
+        print(f"{'═' * 62}", file=sys.stderr)
+        sys.exit(3)  # distinct from generic exit 1 — wrappers can recognize "tier too small"
     finally:
         if src: src.close()
         if tgt: tgt.close()
