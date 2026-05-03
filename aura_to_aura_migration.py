@@ -77,6 +77,39 @@ _INDEX_CREATE_RE = re.compile(
 # and unnamed ("CREATE CONSTRAINT FOR …") forms; the createStatement always contains FOR.
 _CONSTRAINT_FOR_RE = re.compile(r"\sFOR\s", re.IGNORECASE)
 
+# Emit per-label/per-rel-type progress every N seconds so unattended runs (e.g. --mode=ec2,
+# where stdout is captured by SSM and tqdm's carriage-return updates don't survive) still
+# show liveness. tqdm continues to be the primary feedback when running on a TTY.
+HEARTBEAT_INTERVAL_SEC = 20.0
+
+
+class _Heartbeat:
+    def __init__(self, label: str, total: int, interval_sec: float = HEARTBEAT_INTERVAL_SEC):
+        self.label = label
+        self.total = total
+        self.interval = interval_sec
+        self.start = time.time()
+        self.last_emit = self.start
+        self.done = 0
+
+    def tick(self, count: int) -> None:
+        self.done += count
+        now = time.time()
+        if now - self.last_emit < self.interval:
+            return
+        elapsed = now - self.start
+        rate = self.done / elapsed if elapsed > 0 else 0
+        pct = (self.done / self.total * 100) if self.total else 0
+        remaining = max(self.total - self.done, 0)
+        eta = remaining / rate if rate > 0 else 0
+        print(
+            f"  [{self.label}] {self.done:,}/{self.total:,} ({pct:.1f}%) "
+            f"rate {rate:,.0f}/s elapsed {elapsed:.0f}s ETA {eta:.0f}s",
+            flush=True,
+        )
+        self.last_emit = now
+
+
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
 def load_checkpoint(path: str) -> dict:
@@ -131,15 +164,29 @@ def id_map_put(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None:
 
 
 def id_map_get(conn: sqlite3.Connection, source_eids: List[str]) -> Dict[str, str]:
-    """Return {source_eid: target_eid} for all source_eids present in the map."""
+    """Return {source_eid: target_eid} for all source_eids present in the map.
+
+    Chunks the lookup internally so callers can pass batches of any size —
+    SQLite caps a single statement's variable count at 999 on older builds and
+    32,766 on newer (Python 3.12+ / SQLite ≥ 3.32). With `--batch-size 40000`
+    Phase 3 hands us up to ~80,000 unique eids per call (start + end of each
+    rel), which blows past either limit. 5,000 keeps us safely under both
+    while limiting round-trips.
+    """
     if not source_eids:
         return {}
-    placeholders = ",".join("?" * len(source_eids))
-    cur = conn.execute(
-        f"SELECT source_eid, target_eid FROM id_map WHERE source_eid IN ({placeholders})",
-        source_eids,
-    )
-    return {row[0]: row[1] for row in cur.fetchall()}
+    out: Dict[str, str] = {}
+    CHUNK = 5_000
+    for i in range(0, len(source_eids), CHUNK):
+        chunk = source_eids[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        cur = conn.execute(
+            f"SELECT source_eid, target_eid FROM id_map WHERE source_eid IN ({placeholders})",
+            chunk,
+        )
+        for row in cur.fetchall():
+            out[row[0]] = row[1]
+    return out
 
 
 # ── Driver helpers ─────────────────────────────────────────────────────────────
@@ -277,7 +324,7 @@ def migrate_nodes(
     print(f"  Labels: {', '.join(labels)}\n")
 
     migrated = 0
-    pbar = tqdm(total=total_nodes, unit="nodes") if HAS_TQDM else None
+    pbar = tqdm(total=total_nodes, unit="nodes", disable=not sys.stdout.isatty()) if HAS_TQDM else None
 
     for label in labels:
         if label in cp["labels_complete"]:
@@ -292,6 +339,7 @@ def migrate_nodes(
         last_eid = cp["label_last_eid"].get(label, "")
         label_total = count_query(src, f"MATCH (n:`{label}`) RETURN count(n) AS cnt")
         label_written = 0
+        hb = _Heartbeat(label, label_total)
 
         if last_eid:
             done_so_far = count_query(
@@ -302,6 +350,7 @@ def migrate_nodes(
             print(f"  [{label}] resuming after {done_so_far:,}/{label_total:,}")
             if pbar:
                 pbar.update(done_so_far)
+            hb.done = done_so_far
 
         while True:
             records = run_query(
@@ -345,6 +394,7 @@ def migrate_nodes(
 
             if pbar:
                 pbar.update(len(new_records))
+            hb.tick(len(new_records))
 
             cp["label_last_eid"][label] = last_eid
             save_checkpoint(cp_path, cp)
@@ -386,7 +436,7 @@ def migrate_relationships(
     print(f"  Rel types: {', '.join(rel_types)}\n")
 
     migrated = 0
-    pbar = tqdm(total=total_rels, unit="rels") if HAS_TQDM else None
+    pbar = tqdm(total=total_rels, unit="rels", disable=not sys.stdout.isatty()) if HAS_TQDM else None
 
     for rel_type in rel_types:
         if rel_type in cp["rel_types_complete"]:
@@ -399,6 +449,7 @@ def migrate_relationships(
         last_eid = cp["rel_type_last_eid"].get(rel_type, "")
         rel_total = count_query(src, f"MATCH ()-[r:`{rel_type}`]->() RETURN count(r) AS cnt")
         rel_written = 0
+        hb = _Heartbeat(rel_type, rel_total)
 
         if last_eid:
             done_so_far = count_query(
@@ -410,6 +461,7 @@ def migrate_relationships(
             print(f"  [{rel_type}] resuming after {done_so_far:,}/{rel_total:,}")
             if pbar:
                 pbar.update(done_so_far)
+            hb.done = done_so_far
 
         while True:
             records = run_query(
@@ -464,6 +516,7 @@ def migrate_relationships(
 
             if pbar:
                 pbar.update(count)
+            hb.tick(count)
 
             cp["rel_type_last_eid"][rel_type] = last_eid
             save_checkpoint(cp_path, cp)
@@ -552,32 +605,93 @@ def _wait_for_ssm(ssm_client: Any, instance_id: str, timeout: int = 300) -> None
     raise TimeoutError(f"SSM agent not ready on {instance_id} after {timeout}s")
 
 
-def _stream_ssm_output(ssm_client: Any, instance_id: str, command_id: str) -> int:
-    time.sleep(5)  # give SSM time to register the invocation before first poll
-    printed = 0
-    while True:
+_REMOTE_LOG_PATH = "/tmp/migrate.log"
+_TAIL_POLL_INTERVAL_SEC = 5
+_TAIL_INVOCATION_TIMEOUT_SEC = 10
+
+
+def _tail_remote_log(ssm_client: Any, instance_id: str, byte_offset: int) -> str:
+    """Send a short sidecar SSM command that does `tail -c +N` on the remote log.
+
+    SSM's `StandardOutputContent` only surfaces output for COMPLETED commands.
+    The main migration runs for many minutes (no surfaced stdout), but a sidecar
+    `tail` finishes in milliseconds → its output is available immediately.
+    Returns the new bytes since `byte_offset` (empty string if file missing or
+    no new content yet).
+    """
+    cmd = f"tail -c +{byte_offset + 1} {_REMOTE_LOG_PATH} 2>/dev/null || true"
+    resp = ssm_client.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": [cmd]},
+        TimeoutSeconds=30,
+    )
+    tail_id = resp["Command"]["CommandId"]
+    deadline = time.time() + _TAIL_INVOCATION_TIMEOUT_SEC
+    while time.time() < deadline:
         try:
             result = ssm_client.get_command_invocation(
-                CommandId=command_id, InstanceId=instance_id
+                CommandId=tail_id, InstanceId=instance_id
             )
         except ssm_client.exceptions.InvocationDoesNotExist:
-            time.sleep(5)
+            time.sleep(0.5)
             continue
+        if result["Status"] in ("Success", "Failed", "Cancelled", "TimedOut"):
+            return result.get("StandardOutputContent", "") or ""
+        time.sleep(0.5)
+    return ""
 
-        status = result["Status"]
-        stdout = result.get("StandardOutputContent", "")
-        stderr = result.get("StandardErrorContent", "")
 
-        if len(stdout) > printed:
-            print(stdout[printed:], end="", flush=True)
-            printed = len(stdout)
+def _stream_ssm_output(ssm_client: Any, instance_id: str, command_id: str) -> int:
+    """Stream the EC2 migration's stdout in near-real time.
 
-        if status in ("Success", "Failed", "Cancelled", "TimedOut"):
+    Strategy: the main RunShellScript pipes migration output to /tmp/migrate.log
+    via tee. We poll `get_command_invocation` for the main command's status, and
+    in parallel send short sidecar `tail -c +N` SSM commands to read new bytes
+    from the log file. Sidecar commands return their stdout immediately, which
+    bypasses SSM's mid-run StandardOutputContent buffering on long-running
+    commands.
+    """
+    time.sleep(5)  # give SSM time to register the main command + create the log
+    bytes_seen = 0
+
+    while True:
+        # 1) Main-command status check.
+        try:
+            main = ssm_client.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id
+            )
+            main_status = main["Status"]
+        except ssm_client.exceptions.InvocationDoesNotExist:
+            main_status = "InProgress"
+            main = {"ResponseCode": -1, "StandardErrorContent": ""}
+
+        # 2) Sidecar tail — print any new bytes since last poll.
+        try:
+            new_text = _tail_remote_log(ssm_client, instance_id, bytes_seen)
+        except Exception as exc:  # noqa: BLE001 — never fail the migration on a tail glitch
+            new_text = ""
+            print(f"  (tail-sidecar failed: {exc})", file=sys.stderr, flush=True)
+
+        if new_text:
+            print(new_text, end="", flush=True)
+            bytes_seen += len(new_text.encode("utf-8"))
+
+        # 3) Terminal main status — final flush + return.
+        if main_status in ("Success", "Failed", "Cancelled", "TimedOut"):
+            # One last tail to catch anything written after our last poll.
+            try:
+                final = _tail_remote_log(ssm_client, instance_id, bytes_seen)
+                if final:
+                    print(final, end="", flush=True)
+            except Exception:
+                pass
+            stderr = main.get("StandardErrorContent", "")
             if stderr:
                 print(stderr, file=sys.stderr)
-            return result["ResponseCode"]
+            return main.get("ResponseCode", -1)
 
-        time.sleep(10)
+        time.sleep(_TAIL_POLL_INTERVAL_SEC)
 
 
 def _build_passthrough_flags(args: argparse.Namespace) -> str:
@@ -676,6 +790,8 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
         command_lines: List[str] = [
             "#!/bin/bash",
             "set -euo pipefail",
+            # Amazon Linux 2023 ships python3 but not pip — install it first.
+            "sudo dnf -y -q install python3-pip",
             "pip3 install -q neo4j tqdm",
             "rm -f /tmp/migrate.b64 /tmp/migrate.py",
         ]
@@ -687,14 +803,28 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
             # Aura passwords go through env vars, not argv, so they don't leak via /proc.
             f'export SOURCE_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
             f'export TARGET_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{tgt_pw_path}" --with-decryption --query Parameter.Value --output text)',
-            f'python3 /tmp/migrate.py --mode=local --source-uri="{args.source_uri}" --target-uri="{args.target_uri}" {passthrough}',
+            # Tee to /tmp/migrate.log so the local-side `_stream_ssm_output` can
+            # read deltas via short sidecar `tail -c +N` SSM commands. SSM's
+            # StandardOutputContent doesn't surface output for long-running
+            # commands until they terminate, so we route through a file instead.
+            f'python3 -u /tmp/migrate.py --mode=local --source-uri="{args.source_uri}" --target-uri="{args.target_uri}" {passthrough} 2>&1 | tee /tmp/migrate.log',
         ])
 
+        # SSM has TWO timeouts that both have to be set or the smaller one wins:
+        #   - TimeoutSeconds (API-level, time the command may run before SSM kills it)
+        #   - executionTimeout (document parameter on AWS-RunShellScript, default 3600s)
+        # If executionTimeout is left at its default, the migration is SIGKILL'd at 1 hour
+        # regardless of TimeoutSeconds. We set both to 12 hours — comfortably above the
+        # observed ~75-minute runtime for a 4.7M-node / 10M-rel dataset over Aura PL,
+        # leaving headroom for larger datasets or sustained Aura backpressure.
         cmd_resp = ssm_client.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": command_lines},
-            TimeoutSeconds=7200,
+            Parameters={
+                "commands": command_lines,
+                "executionTimeout": ["43200"],  # 12 hours
+            },
+            TimeoutSeconds=43200,  # 12 hours — must match
         )
         command_id = cmd_resp["Command"]["CommandId"]
         print(f"SSM command: {command_id}\n{'─' * 62}")
