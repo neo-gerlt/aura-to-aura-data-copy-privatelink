@@ -94,6 +94,23 @@ Passwords are never written to disk on the EC2, never appear in
 
 ---
 
+## EC2 sizing
+
+The default `--id-map-mode=memory` loads the full source→target node mapping into a Python dict at Phase 3 start (~256 B per source node), eliminating SQLite lock contention under parallel workers. Total host RAM needed = id_map + ~2 GB OS/Python overhead + ~500 MB headroom. EC2 sizing follows directly from your source's node count:
+
+| Source node count | Recommended `--instance-type` |
+|---|---|
+| ≤ 1M | `t3.medium` (4 GB) |
+| 1M – 5M | **`t3.large` (8 GB)** ← script default |
+| 5M – 15M | `t3.xlarge` (16 GB) |
+| 15M – 50M | `t3.2xlarge` (32 GB) |
+| 50M – 100M | `m6i.4xlarge` (64 GB) |
+| > 100M | `m6i.8xlarge` (128 GB) or larger |
+
+The script's preflight reports the estimated id_map RAM and the host's available memory before Phase 1 starts. If memory is insufficient, it fails fast (exit `4`) with a sizing recommendation. You can override with `--id-map-mode=sqlite` to fall back to per-worker SQLite reads — works on smaller instances but slower under `--parallel-rels > 1`.
+
+---
+
 ## Multi-PrivateLink deployments
 
 The script doesn't care whether source and target share a single
