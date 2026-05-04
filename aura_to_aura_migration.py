@@ -100,7 +100,7 @@ HEARTBEAT_INTERVAL_SEC = 20.0
 
 
 # ── Auto-tune (self-tuning batch sizing) ───────────────────────────────────────
-# See contexts/projects/aura-to-aura-data-copy-pl/tsk-20260502-aura-migration-auto-tune-batch.md
+# See contexts/projects/aura-to-aura-data-copy-privatelink/tsk-20260502-aura-migration-auto-tune-batch.md
 # in the CommandCenter repo for the full design.
 
 # Server status codes that surface as OOM-shaped TransientError. The canonical
