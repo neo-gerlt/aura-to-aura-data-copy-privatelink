@@ -115,8 +115,8 @@ unchanged:
 
 ```bash
 python3 aura_to_aura_migration.py --mode=ec2 \
-  --source-uri=neo4j+s://aaaaaaaa.production-orch-0435.neo4j.io \
-  --target-uri=neo4j+s://bbbbbbbb.production-orch-0789.neo4j.io \
+  --source-uri=neo4j+s://aaaaaaaa.production-orch-XXXX.neo4j.io \
+  --target-uri=neo4j+s://bbbbbbbb.production-orch-YYYY.neo4j.io \
   ...
 ```
 

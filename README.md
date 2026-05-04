@@ -2,6 +2,8 @@
 
 **Securely copy data between two Neo4j Aura instances entirely inside your AWS VPC, over AWS PrivateLink, with no traffic crossing the public internet.**
 
+> **Status: community tool.** This is not an officially supported Neo4j product. It's published under Apache 2.0 and is provided as-is without warranty (see [LICENSE](LICENSE)). For production migrations, validate the script in a non-production environment first and have a rollback plan. Issues and PRs welcome, but response is best-effort.
+
 > **Scope: AWS only.** This script is built specifically for AWS-hosted Aura migrations. `--mode=ec2` provisions an EC2 via `boto3`, stores credentials in AWS SSM Parameter Store, and runs the migration through AWS Systems Manager. The "PrivateLink" referenced throughout the docs is **AWS PrivateLink** specifically.
 >
 > **Not supported:** GCP Aura instances (would need GCE + Secret Manager + IAP equivalents), Azure Aura instances (would need Azure VM + Key Vault + Private Link equivalents), or any cross-cloud pairing. If you need non-AWS support, this isn't the right tool today — track or fork accordingly.
