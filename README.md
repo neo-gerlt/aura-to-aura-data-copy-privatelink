@@ -1,4 +1,4 @@
-# Aura-to-Aura Data Copy with Private Link (AWS)
+# Aura-to-Aura Data Copy with PrivateLink (AWS)
 
 **Copy data between two PrivateLink-only Neo4j Aura instances over Bolt, entirely inside your AWS VPC.**
 
