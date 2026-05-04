@@ -1,6 +1,12 @@
-# Aura-to-Aura Data Copy with Private Link
+# Aura-to-Aura Data Copy with Private Link (AWS)
 
-**Securely copy data between two Neo4j Aura instances entirely inside your VPC, over PrivateLink, with no traffic crossing the public internet.**
+**Securely copy data between two Neo4j Aura instances entirely inside your AWS VPC, over AWS PrivateLink, with no traffic crossing the public internet.**
+
+> **Scope: AWS only.** This script is built specifically for AWS-hosted Aura migrations. `--mode=ec2` provisions an EC2 via `boto3`, stores credentials in AWS SSM Parameter Store, and runs the migration through AWS Systems Manager. The "PrivateLink" referenced throughout the docs is **AWS PrivateLink** specifically.
+>
+> **Not supported:** GCP Aura instances (would need GCE + Secret Manager + IAP equivalents), Azure Aura instances (would need Azure VM + Key Vault + Private Link equivalents), or any cross-cloud pairing. If you need non-AWS support, this isn't the right tool today — track or fork accordingly.
+>
+> If you can run from a host that already has Bolt reachability to both Aura instances (regardless of cloud), `--mode=local` works there too — but the EC2-orchestration mode and the IAM/SSM scaffolding documented below assume AWS.
 
 This is the alternative to `neo4j-admin database upload`, which is point-in-time consistent and preserves Neo4j-internal identifiers, but requires the target's public Bolt to be reachable during the upload — incompatible with PL-only Aura instances.
 

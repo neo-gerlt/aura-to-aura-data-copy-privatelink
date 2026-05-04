@@ -1,4 +1,13 @@
-# Aura-to-Aura Data Copy — Detailed Reference
+# Aura-to-Aura Data Copy — Detailed Reference (AWS)
+
+> **Scope: AWS only.** Every cloud-orchestration path in this script targets
+> AWS specifically — `boto3` for EC2 launch/terminate, AWS Systems Manager
+> for command execution and password storage, AWS PrivateLink for Bolt
+> connectivity, AWS IAM for the instance profile. There is no GCP or Azure
+> equivalent in the current implementation. `--mode=local` will work from
+> any host that has direct Bolt reachability to both Aura instances
+> (regardless of cloud), but the EC2-orchestration scaffolding documented
+> here is AWS-specific.
 
 This document is the deeper companion to [README.md](README.md). The landing
 README covers what the script is, how to run it, EC2 sizing, and how to read

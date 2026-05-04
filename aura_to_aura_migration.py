@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Aura-to-Aura database migration using the Neo4j Python driver over Bolt.
 
-Works with Private Link (public traffic disabled) because Bolt (port 7687)
-is proxied by the VPC Private Link endpoint. Run from an EC2 in the VPC that
-has Private Link endpoints for both source and target Aura instances.
+SCOPE: AWS ONLY. The --mode=ec2 orchestration path uses boto3 (EC2 launch,
+SSM Parameter Store, SSM Run Command), AWS IAM (instance profiles), and
+AWS PrivateLink. There is no GCP or Azure equivalent. --mode=local works
+from any host that has direct Bolt reachability to both Aura instances
+regardless of cloud.
+
+Works with AWS PrivateLink (public Aura traffic disabled) because Bolt
+(port 7687) is proxied by the VPC PrivateLink endpoint. Run from an EC2 in
+the VPC that has PrivateLink endpoints for both source and target Aura
+instances.
 
 Phases:
   0 - Pre-flight    Connectivity check + source node/rel counts
