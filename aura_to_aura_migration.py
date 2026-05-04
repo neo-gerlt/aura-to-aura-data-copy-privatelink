@@ -448,6 +448,91 @@ def id_map_put(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None:
     conn.commit()
 
 
+# Estimated bytes per id_map entry in the Python in-memory dict — two interned
+# strings (~80 B each on CPython 3.10+) plus dict-slot overhead. Empirical
+# floor is closer to 200 B/entry for short elementIds; round up for safety
+# when sizing EC2 RAM.
+_ID_MAP_BYTES_PER_ENTRY = 256
+
+
+def _load_id_map_into_memory(conn: sqlite3.Connection) -> Dict[str, str]:
+    """Stream the full SQLite id_map into a Python dict. Phase 3 reads it via
+    GIL-protected `dict.get` instead of issuing per-batch `SELECT IN (...)`
+    queries, which under N parallel workers pays N× the SQLite shared-lock
+    + page-cache contention cost. SQLite stays the durable store for Phase 2
+    writes + `--resume` correctness; this is purely a Phase 3 read overlay
+    rebuilt fresh each run.
+    """
+    t0 = time.time()
+    print("\n  Loading id_map into memory (mode=memory) ...", flush=True)
+    cur = conn.execute("SELECT source_eid, target_eid FROM id_map")
+    in_mem: Dict[str, str] = {}
+    progress_every = 1_000_000
+    for source_eid, target_eid in cur:
+        in_mem[source_eid] = target_eid
+        if len(in_mem) % progress_every == 0:
+            elapsed = time.time() - t0
+            rate = len(in_mem) / elapsed if elapsed > 0 else 0
+            print(f"    {len(in_mem):>10,} entries  ({rate:,.0f}/s)", flush=True)
+    elapsed = time.time() - t0
+    est_mb = len(in_mem) * _ID_MAP_BYTES_PER_ENTRY / (1024 ** 2)
+    print(f"  ✓ {len(in_mem):,} entries in {elapsed:.1f}s "
+          f"(~{est_mb:,.0f} MB)", flush=True)
+    return in_mem
+
+
+def _recommend_instance_type(node_count: int) -> str:
+    """Map source node count → smallest EC2 instance with enough RAM for an
+    in-memory id_map plus ~2 GB OS/Python overhead and ~500 MB headroom.
+    Sizing assumes ~256 bytes per dict entry."""
+    if node_count <= 1_000_000:    return "t3.medium (4 GB)"
+    if node_count <= 5_000_000:    return "t3.large (8 GB)"
+    if node_count <= 15_000_000:   return "t3.xlarge (16 GB)"
+    if node_count <= 50_000_000:   return "t3.2xlarge (32 GB)"
+    if node_count <= 100_000_000:  return "m6i.4xlarge (64 GB)"
+    return "m6i.8xlarge (128 GB) or larger"
+
+
+def _preflight_id_map_memory(node_count: int, mode: str) -> None:
+    """Estimate id_map RAM for the given source-node count, compare to
+    available memory on the host, and either print a recommendation or
+    bail out with EC2 sizing guidance. Only enforces a hard fail in
+    --id-map-mode=memory; sqlite mode prints info only.
+    """
+    est_bytes = node_count * _ID_MAP_BYTES_PER_ENTRY
+    est_gb = est_bytes / (1024 ** 3)
+    print(f"  id_map estimate : {node_count:,} nodes × ~{_ID_MAP_BYTES_PER_ENTRY} B "
+          f"= ~{est_gb:.2f} GB")
+
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+    except ImportError:
+        print("  (psutil not installed — skipping host memory check)")
+        return
+
+    avail_gb = avail / (1024 ** 3)
+    print(f"  host available  : ~{avail_gb:.2f} GB")
+
+    if mode != "memory":
+        return
+
+    # Need id_map + ~500 MB headroom for batch buffers, driver, etc.
+    needed = est_bytes + (500 * 1024 * 1024)
+    if needed > avail:
+        rec = _recommend_instance_type(node_count)
+        print(
+            f"\n  ✗ Insufficient memory for --id-map-mode=memory on this host.\n"
+            f"    Required (id_map + 500 MB headroom): ~{needed / 1024**3:.2f} GB\n"
+            f"    Available                           : ~{avail_gb:.2f} GB\n"
+            f"    Recommended --instance-type         : {rec}\n"
+            f"    Or pass --id-map-mode=sqlite to fall back to per-worker "
+            f"SQLite reads (slower under parallel-rels but no in-memory cost).",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
+
 def id_map_get(conn: sqlite3.Connection, source_eids: List[str]) -> Dict[str, str]:
     """Return {source_eid: target_eid} for all source_eids present in the map.
 
@@ -891,6 +976,7 @@ def _migrate_rel_worker(
     src: Driver,
     tgt: Driver,
     id_map_path: str,
+    in_mem_id_map: Optional[Dict[str, str]],
     cp: dict,
     cp_path: str,
     cp_lock: threading.Lock,
@@ -913,9 +999,17 @@ def _migrate_rel_worker(
     Source reads use a READ-mode session so Bolt routing distributes them
     across cluster followers. Target writes go through the standard
     write-batch path (auto-tune retries on OOM; one transaction per batch).
-    SQLite ID map is opened per-worker (per-thread connection — the existing
-    sqlite3 default of `check_same_thread=True` is satisfied because this
-    connection is created and used entirely within this worker thread).
+
+    ID map lookup path (per Phase 3 batch):
+      * `in_mem_id_map is not None` → GIL-protected `dict.get`. The dict was
+        loaded once at Phase 3 start by the coordinator; workers share a
+        read-only reference and never mutate. No locking required because
+        `dict.get` is atomic in CPython and Phase 3 is read-only against
+        the id_map.
+      * `in_mem_id_map is None` → per-thread SQLite connection opened here
+        (legacy/fallback path; selectable via --id-map-mode=sqlite). The
+        sqlite3 default `check_same_thread=True` is satisfied because the
+        connection is created and used entirely within this worker thread.
     """
     label_for_state = f"{rel_type}/w{worker_id}" if n_workers > 1 else rel_type
     state: Optional[_AutoTuneState] = (
@@ -930,7 +1024,9 @@ def _migrate_rel_worker(
 
     last_eid = initial_last_eid
     rel_written = 0
-    id_map_conn = sqlite3.connect(id_map_path)
+    id_map_conn: Optional[sqlite3.Connection] = (
+        sqlite3.connect(id_map_path) if in_mem_id_map is None else None
+    )
 
     try:
         while True:
@@ -970,7 +1066,17 @@ def _migrate_rel_worker(
             all_source_eids = list(
                 {r["start_eid"] for r in records} | {r["end_eid"] for r in records}
             )
-            eid_map = id_map_get(id_map_conn, all_source_eids)
+            if in_mem_id_map is not None:
+                # Dict comprehension over GIL-protected dict.get — no SQLite
+                # contention across workers. ~100 ns per lookup vs ~5–20 µs
+                # per SQLite indexed read, plus eliminates the shared-lock
+                # cost we measured at ~2.6× under N=2.
+                eid_map = {
+                    eid: in_mem_id_map[eid]
+                    for eid in all_source_eids if eid in in_mem_id_map
+                }
+            else:
+                eid_map = id_map_get(id_map_conn, all_source_eids)
             if timings:
                 timings.add("id_map_get", time.perf_counter() - t0)
 
@@ -999,8 +1105,21 @@ def _migrate_rel_worker(
             iteration_oom = False
 
             if batch_data:
+                # Canonical lock ordering: sort each batch by (min(start,end),
+                # max(start,end)) before MATCHing the endpoints. This forces
+                # every transaction across every parallel worker to acquire
+                # EXCLUSIVE node locks in the same global order, eliminating
+                # AB/BA deadlock cycles between workers whose batches touch
+                # overlapping node endpoints. Pattern derived from a Neo4j
+                # ingest-tuning case where canonical ordering removed an
+                # observed class of intra- and inter-process deadlocks; we
+                # observed the same class in twitch Run 3 (N=4) before this fix.
                 cypher = (
                     "UNWIND $batch AS row "
+                    "WITH row "
+                    "ORDER BY "
+                    "  CASE WHEN row.start_eid < row.end_eid THEN row.start_eid ELSE row.end_eid END, "
+                    "  CASE WHEN row.start_eid < row.end_eid THEN row.end_eid ELSE row.start_eid END "
                     "MATCH (a) WHERE elementId(a) = row.start_eid "
                     "MATCH (b) WHERE elementId(b) = row.end_eid "
                     f"CREATE (a)-[r:`{rel_type}`]->(b) "
@@ -1045,7 +1164,8 @@ def _migrate_rel_worker(
             if count < current_limit:
                 break
     finally:
-        id_map_conn.close()
+        if id_map_conn is not None:
+            id_map_conn.close()
 
     return rel_written
 
@@ -1061,6 +1181,7 @@ def migrate_relationships(
     auto_tune: bool = False,
     profile_batches: bool = False,
     parallel_rels: int = 1,
+    id_map_mode: str = "memory",
 ) -> int:
     print("\n── Phase 3: Relationships ───────────────────────────────────────")
 
@@ -1071,7 +1192,16 @@ def migrate_relationships(
     print(f"  Rel types: {', '.join(rel_types)}\n")
     if parallel_rels > 1:
         print(f"  Parallel workers per rel type: up to {parallel_rels} "
-              f"(auto-clamped on small types)\n")
+              f"(auto-clamped on small types)")
+    print(f"  ID map mode: {id_map_mode}")
+
+    # Build in-memory id_map (memory mode) once, reused by all workers across
+    # all rel types. Skips SQLite-read contention that otherwise costs ~2.6×
+    # per worker per batch under N>=2.
+    in_mem_id_map: Optional[Dict[str, str]] = None
+    if id_map_mode == "memory":
+        with sqlite3.connect(id_map_path) as load_conn:
+            in_mem_id_map = _load_id_map_into_memory(load_conn)
 
     migrated = 0
     pbar = tqdm(total=total_rels, unit="rels", disable=not sys.stdout.isatty()) if HAS_TQDM else None
@@ -1126,6 +1256,7 @@ def migrate_relationships(
         if n == 1:
             rel_written_total = _migrate_rel_worker(
                 rel_type=rel_type, src=src, tgt=tgt, id_map_path=id_map_path,
+                in_mem_id_map=in_mem_id_map,
                 cp=cp, cp_path=cp_path, cp_lock=cp_lock,
                 worker_id=0, n_workers=1,
                 initial_last_eid=partition[0][0], upper_bound=partition[0][1],
@@ -1141,6 +1272,7 @@ def migrate_relationships(
                         ex.submit(
                             _migrate_rel_worker,
                             rel_type=rel_type, src=src, tgt=tgt, id_map_path=id_map_path,
+                            in_mem_id_map=in_mem_id_map,
                             cp=cp, cp_path=cp_path, cp_lock=cp_lock,
                             worker_id=i, n_workers=n,
                             initial_last_eid=partition[i][0], upper_bound=partition[i][1],
@@ -1365,6 +1497,8 @@ def _build_passthrough_flags(args: argparse.Namespace) -> str:
         flags.append("--profile-batches")
     if args.parallel_rels != DEFAULT_PARALLEL_RELS:
         flags.append(f"--parallel-rels {args.parallel_rels}")
+    if args.id_map_mode != "memory":
+        flags.append(f"--id-map-mode {args.id_map_mode}")
     return " ".join(flags)
 
 
@@ -1457,7 +1591,7 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
             "set -euo pipefail",
             # Amazon Linux 2023 ships python3 but not pip — install it first.
             "sudo dnf -y -q install python3-pip",
-            "pip3 install -q neo4j tqdm",
+            "pip3 install -q neo4j tqdm psutil",
             "rm -f /tmp/migrate.b64 /tmp/migrate.py",
         ]
         for chunk in chunks:
@@ -1558,6 +1692,15 @@ def parse_args() -> argparse.Namespace:
                           "READ-mode source session so Bolt routing distributes reads "
                           "across the source cluster's followers. Auto-clamps to 1 for "
                           "rel types smaller than MIN_BATCH * N.")
+    beh.add_argument("--id-map-mode",      choices=["memory", "sqlite"], default="memory",
+                     help="Phase 3 id_map storage. 'memory' (default) loads the full "
+                          "SQLite id_map into a Python dict at Phase 3 start so "
+                          "parallel workers do GIL-protected lookups instead of "
+                          "concurrent SQLite reads (eliminates the ~2.6× id_map_get "
+                          "overhead measured under N>=2). 'sqlite' keeps per-worker "
+                          "SQLite connections — use when the host doesn't have enough "
+                          "RAM for the full id_map (~256 bytes per source node; see "
+                          "README §Sizing).")
     beh.add_argument("--overwrite",        action="store_true",
                      help="Proceed even if target is not empty")
     beh.add_argument("--resume",           action="store_true",
@@ -1582,8 +1725,11 @@ def parse_args() -> argparse.Namespace:
                      help="Security group ID — must allow outbound 7687 (AWS_SECURITY_GROUP_ID)")
     ec2.add_argument("--instance-profile",  default=os.environ.get("AWS_INSTANCE_PROFILE"),
                      help="IAM instance profile ARN — needs ssm:GetParameter (AWS_INSTANCE_PROFILE)")
-    ec2.add_argument("--instance-type",     default="t3.medium",
-                     help="EC2 instance type (default: t3.medium)")
+    ec2.add_argument("--instance-type",     default="t3.large",
+                     help="EC2 instance type (default: t3.large — 8 GB, "
+                          "covers ≤5M-node graphs in --id-map-mode=memory. "
+                          "Bump to t3.xlarge / t3.2xlarge for larger graphs; "
+                          "see README §Sizing).")
     ec2.add_argument("--aws-region",        default=os.environ.get("AWS_DEFAULT_REGION"),
                      help="AWS region (default: AWS_DEFAULT_REGION or boto3 default)")
 
@@ -1672,6 +1818,10 @@ def main() -> None:
         # --resume implies the target is expected to have prior-run data.
         counts = preflight(src, tgt, args.overwrite or args.dry_run or args.resume)
 
+        # Memory sizing recommendation / hard fail for in-memory id_map mode.
+        # Done after preflight so we have an authoritative source node count.
+        _preflight_id_map_memory(counts["src_nodes"], args.id_map_mode)
+
         if args.dry_run:
             print("\n  Dry run complete — no data written.")
             return
@@ -1707,6 +1857,7 @@ def main() -> None:
                 auto_tune=args.auto_tune_batch_size,
                 profile_batches=args.profile_batches,
                 parallel_rels=args.parallel_rels,
+                id_map_mode=args.id_map_mode,
             )
 
         # ── Phase 4 ───────────────────────────────────────────────────────────

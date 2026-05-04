@@ -1,5 +1,6 @@
 neo4j>=5.0
 tqdm>=4.0
+psutil>=5.9
 
 # Required for --mode=ec2 only
 boto3>=1.26
