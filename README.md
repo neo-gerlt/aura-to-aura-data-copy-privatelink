@@ -14,7 +14,7 @@ This script exists for cases the built-in tools don't cover. Try those first:
 |---|---|---|
 | **Aura clone** (console "Clone to") | Same Aura project (tenant) and same region; clone feature supports your source/target pair | Cross-tenant (different orgs/projects); |
 | **Aura Data Importer** | Source dump ≤ 4 GB | Dump > 4 GB |
-| **[`neo4j-admin database upload`](https://support.neo4j.com/s/article/10932963739539-Using-neo4j-admin-database-upload-in-Neo4j-5-x-to-load-a-database-dump-to-Neo4j-Aura)** | You can disable privatelink / allow public access to Aura; you need `elementId` preservation | PrivateLink Only (no turning public connectivity on even temporarily) |
+| **[`neo4j-admin database upload`](https://support.neo4j.com/s/article/10932963739539-Using-neo4j-admin-database-upload-in-Neo4j-5-x-to-load-a-database-dump-to-Neo4j-Aura)** | You can disable PrivateLink / allow public access to Aura; you need `elementId` preservation | PrivateLink Only (no turning public connectivity on even temporarily) |
 | **This script** | Both Auras are PL-only **and** one of: dump > 4 GB, cross-tenant, pre-existing target, or compliance requires bytes stay in your VPC | Source can't be quiescent; `elementId` preservation required; one of the above tools fits |
 
 Detailed criteria + alternatives for live-source migrations: [README_DETAILED.md § Use-when, and not-when](README_DETAILED.md#use-when-and-not-when).
