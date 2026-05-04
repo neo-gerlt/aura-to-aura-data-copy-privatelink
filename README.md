@@ -12,7 +12,7 @@ This script exists for cases the built-in tools don't cover. Try those first:
 
 | Tool | Use when | Don't use when |
 |---|---|---|
-| **Aura clone** (console "Clone to") | Same Aura tenant; clone feature supports your source/target pair | Cross-tenant (different orgs/projects); copying into a pre-existing target you've already configured; bytes must demonstrably stay inside your VPC |
+| **Aura clone** (console "Clone to") | Same Aura project (tenant) and same region; clone feature supports your source/target pair | Cross-tenant (different orgs/projects); cross-region; copying into a pre-existing target you've already configured; bytes must demonstrably stay inside your VPC |
 | **Aura Data Importer** | Source dump ≤ 4 GB | Dump > 4 GB |
 | **[`neo4j-admin database upload`](https://support.neo4j.com/s/article/10932963739539-Using-neo4j-admin-database-upload-in-Neo4j-5-x-to-load-a-database-dump-to-Neo4j-Aura)** | Target Aura's public Bolt is reachable; you need `elementId` preservation | Target is PL-only (public Bolt off) |
 | **This script** | Both Auras are PL-only **and** one of: dump > 4 GB, cross-tenant, pre-existing target, or compliance requires bytes stay in your VPC | Source can't be quiescent; `elementId` preservation required; one of the above tools fits |
