@@ -1385,8 +1385,10 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
     print(f"  Type    : {args.instance_type}")
     print("═" * 62)
 
-    source_password = getpass.getpass("\nSource Aura password: ")
-    target_password = getpass.getpass("Target Aura password: ")
+    # Honor env-var/CLI passwords (matches the documented Usage in the module
+    # docstring); only prompt interactively for whichever is missing.
+    source_password = args.source_password or getpass.getpass("\nSource Aura password: ")
+    target_password = args.target_password or getpass.getpass("Target Aura password: ")
 
     run_id = uuid.uuid4().hex[:8]
     ssm_prefix = f"/aura-migration/{run_id}"
