@@ -1,8 +1,9 @@
 # Migration runtime artifacts
-migration_checkpoint.json
-migration_ids.db
+migration_checkpoint*.json
+migration_ids*.db
 migration_run*.log
 target_wipe.log
+mtg_load.log
 
 # Python
 __pycache__/
