@@ -32,7 +32,9 @@ import re
 import signal
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,7 +61,14 @@ DEFAULT_CHECKPOINT_FILE = "migration_checkpoint.json"
 DEFAULT_ID_MAP_DB = "migration_ids.db"
 DEFAULT_USER = "neo4j"
 
-CHECKPOINT_VERSION = 2  # bumped when the checkpoint schema changes incompatibly
+CHECKPOINT_VERSION = 3  # bumped when the checkpoint schema changes incompatibly
+
+DEFAULT_PARALLEL_RELS = 2  # workers per rel type in Phase 3 — 1 = sequential (pre-v3 behavior)
+
+# Module-level shutdown signal so the SIGINT handler can ask Phase 3 workers
+# to exit between batches. Workers poll between batches; in-flight batches
+# finish (or fail their retries) before the worker returns.
+_shutdown_event = threading.Event()
 
 _RETRY_DELAYS = (2, 5, 15, 30, 60, 120)  # seconds between attempts on transient failures
 # Total retry window: ~3.5 min. Sized for Aura connection hiccups that can last
@@ -127,6 +136,43 @@ class InstanceTooSmall(Exception):
         )
 
 
+class _StageTimings:
+    """Per-stage cumulative timing accumulator for `--profile-batches`.
+
+    Stages are accumulated since the last `format_and_reset()` call, so
+    each emitted line covers one heartbeat interval — making slow drift
+    visible mid-run rather than smearing it across the whole label.
+    Thread-safe via a lock so parallel workers can share an instance.
+    """
+
+    STAGES = ("src_read", "id_map_get", "group", "tgt_write", "id_map_put", "ckpt_save")
+
+    def __init__(self) -> None:
+        self.totals: Dict[str, float] = {s: 0.0 for s in self.STAGES}
+        self.batches = 0
+        self._lock = threading.Lock()
+
+    def add(self, stage: str, elapsed: float) -> None:
+        with self._lock:
+            self.totals[stage] += elapsed
+            # batches are counted via mark_batch_end so a partial timing
+            # (e.g. tgt_write only) doesn't inflate the count.
+
+    def mark_batch_end(self) -> None:
+        with self._lock:
+            self.batches += 1
+
+    def format_and_reset(self) -> Optional[str]:
+        with self._lock:
+            if self.batches == 0:
+                return None
+            parts = " ".join(f"{s}={self.totals[s]:.3f}s" for s in self.STAGES)
+            line = f"stages {parts} (n={self.batches})"
+            self.totals = {s: 0.0 for s in self.STAGES}
+            self.batches = 0
+            return line
+
+
 class _Heartbeat:
     def __init__(
         self,
@@ -134,6 +180,8 @@ class _Heartbeat:
         total: int,
         interval_sec: float = HEARTBEAT_INTERVAL_SEC,
         state: Optional["_AutoTuneState"] = None,
+        timings: Optional["_StageTimings"] = None,
+        worker_states: Optional[List["_AutoTuneState"]] = None,
     ):
         self.label = label
         self.total = total
@@ -142,22 +190,40 @@ class _Heartbeat:
         self.last_emit = self.start
         self.done = 0
         self.state = state
+        self.timings = timings
+        # When set, multiple workers contribute to this heartbeat; the per-worker
+        # auto-tune fields are surfaced as a compact suffix instead of `state`.
+        self.worker_states = worker_states
+        self._lock = threading.Lock()
 
     def tick(self, count: int) -> None:
-        self.done += count
-        now = time.time()
-        if now - self.last_emit < self.interval:
-            return
+        with self._lock:
+            self.done += count
+            now = time.time()
+            if now - self.last_emit < self.interval:
+                return
+            done_snapshot = self.done
+            self.last_emit = now
         elapsed = now - self.start
-        rate = self.done / elapsed if elapsed > 0 else 0
-        pct = (self.done / self.total * 100) if self.total else 0
-        remaining = max(self.total - self.done, 0)
+        rate = done_snapshot / elapsed if elapsed > 0 else 0
+        pct = (done_snapshot / self.total * 100) if self.total else 0
+        remaining = max(self.total - done_snapshot, 0)
         eta = remaining / rate if rate > 0 else 0
         line = (
-            f"  [{self.label}] {self.done:,}/{self.total:,} ({pct:.1f}%) "
+            f"  [{self.label}] {done_snapshot:,}/{self.total:,} ({pct:.1f}%) "
             f"rate {rate:,.0f}/s elapsed {elapsed:.0f}s ETA {eta:.0f}s"
         )
-        if self.state is not None:
+        if self.worker_states is not None:
+            # Compact per-worker view: "[w0:25,000 w1:20,000 w2:25,000]"
+            parts = []
+            for i, ws in enumerate(self.worker_states):
+                if ws is None:
+                    continue
+                f = ws.heartbeat_fields()
+                parts.append(f"w{i}:{f['current_batch_size']:,}")
+            if parts:
+                line += f" workers=[{' '.join(parts)}]"
+        elif self.state is not None:
             f = self.state.heartbeat_fields()
             ceiling_str = "∞" if f["discovered_ceiling"] is None else f"{f['discovered_ceiling']:,}"
             last_rate = f"{f['last_batch_rate']:,.0f}/s" if f["last_batch_rate"] else "—"
@@ -168,7 +234,10 @@ class _Heartbeat:
                 f" soft_ceiling={f['soft_ceiling']:,}"
             )
         print(line, flush=True)
-        self.last_emit = now
+        if self.timings is not None:
+            stages_line = self.timings.format_and_reset()
+            if stages_line:
+                print(f"  [{self.label}] {stages_line}", flush=True)
 
 
 def _bootstrap_initial(total_rows: int) -> int:
@@ -292,10 +361,35 @@ def load_checkpoint(path: str) -> dict:
     if Path(path).exists():
         with open(path) as f:
             cp = json.load(f)
-        if cp.get("version") != CHECKPOINT_VERSION:
+        version = cp.get("version")
+        if version == 2 and CHECKPOINT_VERSION == 3:
+            # v2 → v3 shim. v2 stored Phase 3 progress as a flat
+            # `rel_type_last_eid: {<type>: <eid>}`; v3 stores per-worker progress
+            # in `rel_type_workers: {<type>: [{worker_id, last_eid, upper_bound}]}`.
+            # An in-flight v2 checkpoint maps cleanly to a single-worker v3 entry:
+            # the saved cursor becomes worker 0's last_eid, no upper bound. This
+            # preserves --resume across the upgrade without forcing customers
+            # mid-migration to restart from scratch.
+            cp["version"] = 3
+            workers_map = cp.setdefault("rel_type_workers", {})
+            migrated = 0
+            for rel_type, last_eid in cp.get("rel_type_last_eid", {}).items():
+                if last_eid and rel_type not in workers_map:
+                    workers_map[rel_type] = [{
+                        "worker_id": 0,
+                        "last_eid": last_eid,
+                        "upper_bound": None,
+                    }]
+                    migrated += 1
+            print(
+                f"  Migrated checkpoint v2 → v3 ({path}: "
+                f"{migrated} in-flight rel type(s) preserved as single-worker)",
+                file=sys.stderr,
+            )
+        elif version != CHECKPOINT_VERSION:
             print(
                 f"  Incompatible checkpoint format (got version "
-                f"{cp.get('version', 'unversioned')!r}, expected {CHECKPOINT_VERSION}).\n"
+                f"{version!r}, expected {CHECKPOINT_VERSION}).\n"
                 f"  Delete {path} and the ID map and re-run without --resume to start fresh.",
                 file=sys.stderr,
             )
@@ -314,10 +408,25 @@ def load_checkpoint(path: str) -> dict:
     }
 
 
+_checkpoint_write_lock = threading.RLock()
+
+
 def save_checkpoint(path: str, cp: dict) -> None:
-    cp["updated_at"] = datetime.now(timezone.utc).isoformat()
-    with open(path, "w") as f:
-        json.dump(cp, f, indent=2)
+    """Atomic checkpoint write. Phase 3 parallel workers write per-batch from
+    multiple threads; the SIGINT handler also writes from the main thread —
+    a torn write here corrupts JSON and makes --resume impossible. Module-level
+    RLock serializes writers; the reentrant variant matters because the SIGINT
+    handler runs on the main thread synchronously, and if a signal arrives while
+    the main thread is already inside save_checkpoint (e.g. during Phase 1/2
+    state persistence), a non-reentrant lock would deadlock the process.
+    tempfile + os.replace makes the on-disk swap atomic against process kill.
+    """
+    with _checkpoint_write_lock:
+        cp["updated_at"] = datetime.now(timezone.utc).isoformat()
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(cp, f, indent=2)
+        os.replace(tmp_path, path)
 
 
 # ── ID Map (SQLite) ────────────────────────────────────────────────────────────
@@ -337,6 +446,91 @@ def id_map_put(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None:
         "INSERT OR REPLACE INTO id_map (source_eid, target_eid) VALUES (?, ?)", rows
     )
     conn.commit()
+
+
+# Estimated bytes per id_map entry in the Python in-memory dict — two interned
+# strings (~80 B each on CPython 3.10+) plus dict-slot overhead. Empirical
+# floor is closer to 200 B/entry for short elementIds; round up for safety
+# when sizing EC2 RAM.
+_ID_MAP_BYTES_PER_ENTRY = 256
+
+
+def _load_id_map_into_memory(conn: sqlite3.Connection) -> Dict[str, str]:
+    """Stream the full SQLite id_map into a Python dict. Phase 3 reads it via
+    GIL-protected `dict.get` instead of issuing per-batch `SELECT IN (...)`
+    queries, which under N parallel workers pays N× the SQLite shared-lock
+    + page-cache contention cost. SQLite stays the durable store for Phase 2
+    writes + `--resume` correctness; this is purely a Phase 3 read overlay
+    rebuilt fresh each run.
+    """
+    t0 = time.time()
+    print("\n  Loading id_map into memory (mode=memory) ...", flush=True)
+    cur = conn.execute("SELECT source_eid, target_eid FROM id_map")
+    in_mem: Dict[str, str] = {}
+    progress_every = 1_000_000
+    for source_eid, target_eid in cur:
+        in_mem[source_eid] = target_eid
+        if len(in_mem) % progress_every == 0:
+            elapsed = time.time() - t0
+            rate = len(in_mem) / elapsed if elapsed > 0 else 0
+            print(f"    {len(in_mem):>10,} entries  ({rate:,.0f}/s)", flush=True)
+    elapsed = time.time() - t0
+    est_mb = len(in_mem) * _ID_MAP_BYTES_PER_ENTRY / (1024 ** 2)
+    print(f"  ✓ {len(in_mem):,} entries in {elapsed:.1f}s "
+          f"(~{est_mb:,.0f} MB)", flush=True)
+    return in_mem
+
+
+def _recommend_instance_type(node_count: int) -> str:
+    """Map source node count → smallest EC2 instance with enough RAM for an
+    in-memory id_map plus ~2 GB OS/Python overhead and ~500 MB headroom.
+    Sizing assumes ~256 bytes per dict entry."""
+    if node_count <= 1_000_000:    return "t3.medium (4 GB)"
+    if node_count <= 5_000_000:    return "t3.large (8 GB)"
+    if node_count <= 15_000_000:   return "t3.xlarge (16 GB)"
+    if node_count <= 50_000_000:   return "t3.2xlarge (32 GB)"
+    if node_count <= 100_000_000:  return "m6i.4xlarge (64 GB)"
+    return "m6i.8xlarge (128 GB) or larger"
+
+
+def _preflight_id_map_memory(node_count: int, mode: str) -> None:
+    """Estimate id_map RAM for the given source-node count, compare to
+    available memory on the host, and either print a recommendation or
+    bail out with EC2 sizing guidance. Only enforces a hard fail in
+    --id-map-mode=memory; sqlite mode prints info only.
+    """
+    est_bytes = node_count * _ID_MAP_BYTES_PER_ENTRY
+    est_gb = est_bytes / (1024 ** 3)
+    print(f"  id_map estimate : {node_count:,} nodes × ~{_ID_MAP_BYTES_PER_ENTRY} B "
+          f"= ~{est_gb:.2f} GB")
+
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+    except ImportError:
+        print("  (psutil not installed — skipping host memory check)")
+        return
+
+    avail_gb = avail / (1024 ** 3)
+    print(f"  host available  : ~{avail_gb:.2f} GB")
+
+    if mode != "memory":
+        return
+
+    # Need id_map + ~500 MB headroom for batch buffers, driver, etc.
+    needed = est_bytes + (500 * 1024 * 1024)
+    if needed > avail:
+        rec = _recommend_instance_type(node_count)
+        print(
+            f"\n  ✗ Insufficient memory for --id-map-mode=memory on this host.\n"
+            f"    Required (id_map + 500 MB headroom): ~{needed / 1024**3:.2f} GB\n"
+            f"    Available                           : ~{avail_gb:.2f} GB\n"
+            f"    Recommended --instance-type         : {rec}\n"
+            f"    Or pass --id-map-mode=sqlite to fall back to per-worker "
+            f"SQLite reads (slower under parallel-rels but no in-memory cost).",
+            file=sys.stderr,
+        )
+        sys.exit(4)
 
 
 def id_map_get(conn: sqlite3.Connection, source_eids: List[str]) -> Dict[str, str]:
@@ -381,11 +575,23 @@ def open_driver(uri: str, user: str, password: str, label: str) -> Driver:
         raise
 
 
-def run_query(driver: Driver, cypher: str, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
+def run_query(
+    driver: Driver,
+    cypher: str,
+    params: Optional[Dict] = None,
+    access_mode: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Execute a Cypher statement with retry on transient/connection errors.
+
+    `access_mode="READ"` opens the session in read-only mode so Bolt routing
+    can land it on a cluster follower — used by parallel Phase 3 workers to
+    spread source reads across the source cluster's idle replicas.
+    """
+    session_kwargs = {"default_access_mode": access_mode} if access_mode else {}
     last_exc: Optional[Exception] = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
-            with driver.session() as session:
+            with driver.session(**session_kwargs) as session:
                 result = session.run(cypher, params or {})
                 return [record.data() for record in result]
         except (TransientError, ServiceUnavailable, SessionExpired, DatabaseUnavailable) as exc:
@@ -575,6 +781,7 @@ def migrate_nodes(
     batch_size: int,
     total_nodes: int,
     auto_tune: bool = False,
+    profile_batches: bool = False,
 ) -> int:
     print("\n── Phase 2: Nodes ───────────────────────────────────────────────")
 
@@ -605,7 +812,8 @@ def migrate_nodes(
         state: Optional[_AutoTuneState] = (
             _AutoTuneState(label, label_total, initial=autotune_initial) if auto_tune else None
         )
-        hb = _Heartbeat(label, label_total, state=state)
+        timings = _StageTimings() if profile_batches else None
+        hb = _Heartbeat(label, label_total, state=state, timings=timings)
 
         if last_eid:
             done_so_far = count_query(
@@ -620,6 +828,7 @@ def migrate_nodes(
 
         while True:
             current_limit = state.next_size() if state is not None else batch_size
+            t0 = time.perf_counter() if timings else 0.0
             records = run_query(
                 src,
                 f"MATCH (n:`{label}`) WHERE elementId(n) > $last_eid "
@@ -627,39 +836,54 @@ def migrate_nodes(
                 f"ORDER BY elementId(n) LIMIT {current_limit}",
                 {"last_eid": last_eid},
             )
+            if timings:
+                timings.add("src_read", time.perf_counter() - t0)
             if not records:
                 break
 
             # Bulk-check which source eids are already in the map (multi-label dedup)
+            t0 = time.perf_counter() if timings else 0.0
             known = id_map_get(id_map, [r["eid"] for r in records])
+            if timings:
+                timings.add("id_map_get", time.perf_counter() - t0)
+
+            t0 = time.perf_counter() if timings else 0.0
             new_records = [r for r in records if r["eid"] not in known]
 
             iteration_t0 = time.time() if state is not None else None
             iteration_oom = False
 
+            groups: Dict[tuple, list] = {}
             if new_records:
                 # Group by full sorted label tuple → one CREATE per unique label combo
                 # avoids any dependency on APOC
-                groups: Dict[tuple, list] = {}
                 for r in new_records:
                     key = tuple(sorted(r["labels"]))
                     groups.setdefault(key, []).append(r)
+            if timings:
+                timings.add("group", time.perf_counter() - t0)
 
-                for label_combo, group in groups.items():
-                    label_str = _label_clause(label_combo)
-                    cypher = (
-                        f"UNWIND $batch AS row "
-                        f"CREATE (n{label_str}) "
-                        "SET n = row.props "
-                        "RETURN row.source_eid AS source_eid, elementId(n) AS target_eid"
-                    )
-                    batch_data = [{"source_eid": r["eid"], "props": r["props"]} for r in group]
-                    if state is not None:
-                        results, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
-                        iteration_oom = iteration_oom or oom
-                    else:
-                        results = run_query(tgt, cypher, {"batch": batch_data})
-                    id_map_put(id_map, [(r["source_eid"], r["target_eid"]) for r in results])
+            for label_combo, group in groups.items():
+                label_str = _label_clause(label_combo)
+                cypher = (
+                    f"UNWIND $batch AS row "
+                    f"CREATE (n{label_str}) "
+                    "SET n = row.props "
+                    "RETURN row.source_eid AS source_eid, elementId(n) AS target_eid"
+                )
+                batch_data = [{"source_eid": r["eid"], "props": r["props"]} for r in group]
+                t0 = time.perf_counter() if timings else 0.0
+                if state is not None:
+                    results, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
+                    iteration_oom = iteration_oom or oom
+                else:
+                    results = run_query(tgt, cypher, {"batch": batch_data})
+                if timings:
+                    timings.add("tgt_write", time.perf_counter() - t0)
+                t0 = time.perf_counter() if timings else 0.0
+                id_map_put(id_map, [(r["source_eid"], r["target_eid"]) for r in results])
+                if timings:
+                    timings.add("id_map_put", time.perf_counter() - t0)
 
             if state is not None and not iteration_oom and iteration_t0 is not None:
                 state.record_batch(len(new_records), time.time() - iteration_t0)
@@ -671,10 +895,15 @@ def migrate_nodes(
 
             if pbar:
                 pbar.update(len(new_records))
-            hb.tick(len(new_records))
 
             cp["label_last_eid"][label] = last_eid
+            t0 = time.perf_counter() if timings else 0.0
             save_checkpoint(cp_path, cp)
+            if timings:
+                timings.add("ckpt_save", time.perf_counter() - t0)
+                timings.mark_batch_end()
+
+            hb.tick(len(new_records))
 
             if count < current_limit:
                 break
@@ -695,15 +924,264 @@ def migrate_nodes(
 
 # ── Phase 3: Relationships ─────────────────────────────────────────────────────
 
+def _discover_rel_partition(
+    src: Driver, rel_type: str, count: int, n_workers: int
+) -> List[Tuple[str, Optional[str]]]:
+    """Return a list of (initial_last_eid, upper_bound_inclusive) tuples — one
+    per worker. Each tuple defines the worker's slice of the rel type:
+        WHERE elementId(r) > $last_eid AND elementId(r) <= $upper_bound
+
+    Worker 0's `initial_last_eid` is "" (the existing unbounded-below sentinel).
+    The last worker's `upper_bound` is None (unbounded above).
+
+    Auto-clamps to a single full-range partition when:
+      - n_workers <= 1
+      - count < MIN_BATCH * n_workers (too small to bother partitioning)
+      - SKIP/LIMIT discovery returned fewer boundaries than expected (rel
+        type shrunk between count() and partition discovery)
+    """
+    if n_workers <= 1 or count < MIN_BATCH * n_workers:
+        return [("", None)]
+
+    boundaries: List[str] = []
+    # boundary[k] = elementId at position (count*(k+1)/n_workers - 1), i.e. the
+    # last row of worker k's slice — used as worker (k+1)'s `last_eid` so the
+    # next worker's `> last_eid` cursor picks up exactly where worker k ended.
+    for k in range(n_workers - 1):
+        skip = (count * (k + 1)) // n_workers - 1
+        if skip < 0:
+            return [("", None)]
+        rows = run_query(
+            src,
+            f"MATCH ()-[r:`{rel_type}`]->() WITH r ORDER BY elementId(r) "
+            f"SKIP {skip} LIMIT 1 RETURN elementId(r) AS eid",
+            access_mode="READ",
+        )
+        if not rows:
+            return [("", None)]
+        boundaries.append(rows[0]["eid"])
+
+    out: List[Tuple[str, Optional[str]]] = []
+    prev = ""
+    for b in boundaries:
+        out.append((prev, b))
+        prev = b
+    out.append((prev, None))
+    return out
+
+
+def _migrate_rel_worker(
+    *,
+    rel_type: str,
+    src: Driver,
+    tgt: Driver,
+    id_map_path: str,
+    in_mem_id_map: Optional[Dict[str, str]],
+    cp: dict,
+    cp_path: str,
+    cp_lock: threading.Lock,
+    worker_id: int,
+    n_workers: int,
+    initial_last_eid: str,
+    upper_bound: Optional[str],
+    batch_size: int,
+    auto_tune: bool,
+    autotune_initial: Optional[int],
+    rel_total: int,
+    state_holder: List[Optional["_AutoTuneState"]],
+    timings: Optional[_StageTimings],
+    hb: _Heartbeat,
+    pbar: Optional[Any],
+    pbar_lock: threading.Lock,
+) -> int:
+    """One worker for one rel type slice. Returns rels_written.
+
+    Source reads use a READ-mode session so Bolt routing distributes them
+    across cluster followers. Target writes go through the standard
+    write-batch path (auto-tune retries on OOM; one transaction per batch).
+
+    ID map lookup path (per Phase 3 batch):
+      * `in_mem_id_map is not None` → GIL-protected `dict.get`. The dict was
+        loaded once at Phase 3 start by the coordinator; workers share a
+        read-only reference and never mutate. No locking required because
+        `dict.get` is atomic in CPython and Phase 3 is read-only against
+        the id_map.
+      * `in_mem_id_map is None` → per-thread SQLite connection opened here
+        (legacy/fallback path; selectable via --id-map-mode=sqlite). The
+        sqlite3 default `check_same_thread=True` is satisfied because the
+        connection is created and used entirely within this worker thread.
+    """
+    label_for_state = f"{rel_type}/w{worker_id}" if n_workers > 1 else rel_type
+    state: Optional[_AutoTuneState] = (
+        _AutoTuneState(label_for_state, rel_total, initial=autotune_initial) if auto_tune else None
+    )
+    state_holder[worker_id] = state
+    # For n=1, surface the rich auto-tune heartbeat (last_batch_rate, ceiling,
+    # soft_ceiling) — matches the pre-parallel single-worker output so
+    # --parallel-rels=1 stays a clean regression baseline.
+    if n_workers == 1:
+        hb.state = state
+
+    last_eid = initial_last_eid
+    rel_written = 0
+    id_map_conn: Optional[sqlite3.Connection] = (
+        sqlite3.connect(id_map_path) if in_mem_id_map is None else None
+    )
+
+    try:
+        while True:
+            if _shutdown_event.is_set():
+                return rel_written
+
+            current_limit = state.next_size() if state is not None else batch_size
+
+            t0 = time.perf_counter() if timings else 0.0
+            if upper_bound is None:
+                records = run_query(
+                    src,
+                    f"MATCH (a)-[r:`{rel_type}`]->(b) WHERE elementId(r) > $last_eid "
+                    "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
+                    "       elementId(b) AS end_eid, properties(r) AS props "
+                    f"ORDER BY elementId(r) LIMIT {current_limit}",
+                    {"last_eid": last_eid},
+                    access_mode="READ",
+                )
+            else:
+                records = run_query(
+                    src,
+                    f"MATCH (a)-[r:`{rel_type}`]->(b) "
+                    "WHERE elementId(r) > $last_eid AND elementId(r) <= $upper_bound "
+                    "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
+                    "       elementId(b) AS end_eid, properties(r) AS props "
+                    f"ORDER BY elementId(r) LIMIT {current_limit}",
+                    {"last_eid": last_eid, "upper_bound": upper_bound},
+                    access_mode="READ",
+                )
+            if timings:
+                timings.add("src_read", time.perf_counter() - t0)
+            if not records:
+                break
+
+            t0 = time.perf_counter() if timings else 0.0
+            all_source_eids = list(
+                {r["start_eid"] for r in records} | {r["end_eid"] for r in records}
+            )
+            if in_mem_id_map is not None:
+                # Dict comprehension over GIL-protected dict.get — no SQLite
+                # contention across workers. ~100 ns per lookup vs ~5–20 µs
+                # per SQLite indexed read, plus eliminates the shared-lock
+                # cost we measured at ~2.6× under N=2.
+                eid_map = {
+                    eid: in_mem_id_map[eid]
+                    for eid in all_source_eids if eid in in_mem_id_map
+                }
+            else:
+                eid_map = id_map_get(id_map_conn, all_source_eids)
+            if timings:
+                timings.add("id_map_get", time.perf_counter() - t0)
+
+            t0 = time.perf_counter() if timings else 0.0
+            batch_data = []
+            missing = 0
+            for r in records:
+                t_start = eid_map.get(r["start_eid"])
+                t_end = eid_map.get(r["end_eid"])
+                if t_start and t_end:
+                    batch_data.append({
+                        "start_eid": t_start,
+                        "end_eid": t_end,
+                        "props": r["props"],
+                    })
+                else:
+                    missing += 1
+            if timings:
+                timings.add("group", time.perf_counter() - t0)
+
+            if missing:
+                print(f"    WARN [{label_for_state}]: {missing} relationships skipped "
+                      f"(node not in ID map)", flush=True)
+
+            iteration_t0 = time.time() if state is not None else None
+            iteration_oom = False
+
+            if batch_data:
+                # Canonical lock ordering: sort each batch by (min(start,end),
+                # max(start,end)) before MATCHing the endpoints. This forces
+                # every transaction across every parallel worker to acquire
+                # EXCLUSIVE node locks in the same global order, eliminating
+                # AB/BA deadlock cycles between workers whose batches touch
+                # overlapping node endpoints. Pattern derived from a Neo4j
+                # ingest-tuning case where canonical ordering removed an
+                # observed class of intra- and inter-process deadlocks; we
+                # observed the same class in twitch Run 3 (N=4) before this fix.
+                cypher = (
+                    "UNWIND $batch AS row "
+                    "WITH row "
+                    "ORDER BY "
+                    "  CASE WHEN row.start_eid < row.end_eid THEN row.start_eid ELSE row.end_eid END, "
+                    "  CASE WHEN row.start_eid < row.end_eid THEN row.end_eid ELSE row.start_eid END "
+                    "MATCH (a) WHERE elementId(a) = row.start_eid "
+                    "MATCH (b) WHERE elementId(b) = row.end_eid "
+                    f"CREATE (a)-[r:`{rel_type}`]->(b) "
+                    "SET r = row.props "
+                    "RETURN count(r) AS created"
+                )
+                t0 = time.perf_counter() if timings else 0.0
+                if state is not None:
+                    _, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
+                    iteration_oom = oom
+                else:
+                    run_query(tgt, cypher, {"batch": batch_data})
+                if timings:
+                    timings.add("tgt_write", time.perf_counter() - t0)
+
+            if state is not None and not iteration_oom and iteration_t0 is not None:
+                state.record_batch(len(batch_data), time.time() - iteration_t0)
+
+            count = len(records)
+            last_eid = records[-1]["r_eid"]
+            rel_written += len(batch_data)
+
+            if pbar:
+                with pbar_lock:
+                    pbar.update(count)
+
+            t0 = time.perf_counter() if timings else 0.0
+            with cp_lock:
+                workers = cp.setdefault("rel_type_workers", {}).setdefault(rel_type, [])
+                # Slot may have been pre-populated by the coordinator; ensure it exists.
+                while len(workers) <= worker_id:
+                    workers.append({"worker_id": len(workers), "last_eid": "", "upper_bound": None})
+                workers[worker_id]["last_eid"] = last_eid
+                workers[worker_id]["upper_bound"] = upper_bound
+                save_checkpoint(cp_path, cp)
+            if timings:
+                timings.add("ckpt_save", time.perf_counter() - t0)
+                timings.mark_batch_end()
+
+            hb.tick(count)
+
+            if count < current_limit:
+                break
+    finally:
+        if id_map_conn is not None:
+            id_map_conn.close()
+
+    return rel_written
+
+
 def migrate_relationships(
     src: Driver,
     tgt: Driver,
-    id_map: sqlite3.Connection,
+    id_map_path: str,
     cp: dict,
     cp_path: str,
     batch_size: int,
     total_rels: int,
     auto_tune: bool = False,
+    profile_batches: bool = False,
+    parallel_rels: int = 1,
+    id_map_mode: str = "memory",
 ) -> int:
     print("\n── Phase 3: Relationships ───────────────────────────────────────")
 
@@ -712,9 +1190,23 @@ def migrate_relationships(
         for r in run_query(src, "CALL db.relationshipTypes() YIELD relationshipType")
     ]
     print(f"  Rel types: {', '.join(rel_types)}\n")
+    if parallel_rels > 1:
+        print(f"  Parallel workers per rel type: up to {parallel_rels} "
+              f"(auto-clamped on small types)")
+    print(f"  ID map mode: {id_map_mode}")
+
+    # Build in-memory id_map (memory mode) once, reused by all workers across
+    # all rel types. Skips SQLite-read contention that otherwise costs ~2.6×
+    # per worker per batch under N>=2.
+    in_mem_id_map: Optional[Dict[str, str]] = None
+    if id_map_mode == "memory":
+        with sqlite3.connect(id_map_path) as load_conn:
+            in_mem_id_map = _load_id_map_into_memory(load_conn)
 
     migrated = 0
     pbar = tqdm(total=total_rels, unit="rels", disable=not sys.stdout.isatty()) if HAS_TQDM else None
+    pbar_lock = threading.Lock()
+    cp_lock = threading.Lock()
 
     autotune_initial = batch_size if (auto_tune and batch_size != DEFAULT_BATCH_SIZE) else None
 
@@ -726,103 +1218,100 @@ def migrate_relationships(
             print(f"  [{rel_type}] already complete — skipping")
             continue
 
-        last_eid = cp["rel_type_last_eid"].get(rel_type, "")
         rel_total = count_query(src, f"MATCH ()-[r:`{rel_type}`]->() RETURN count(r) AS cnt")
-        rel_written = 0
+        timings = _StageTimings() if profile_batches else None
 
-        state: Optional[_AutoTuneState] = (
-            _AutoTuneState(rel_type, rel_total, initial=autotune_initial) if auto_tune else None
-        )
-        hb = _Heartbeat(rel_type, rel_total, state=state)
+        # Resume path: workers state already in checkpoint.
+        existing_workers = cp.get("rel_type_workers", {}).get(rel_type)
+        if existing_workers:
+            partition = [(w["last_eid"], w["upper_bound"]) for w in existing_workers]
+            print(f"  [{rel_type}] resuming with {len(partition)} worker slot(s) from checkpoint")
+        else:
+            partition = _discover_rel_partition(src, rel_type, rel_total, parallel_rels)
+            with cp_lock:
+                cp.setdefault("rel_type_workers", {})[rel_type] = [
+                    {"worker_id": i, "last_eid": p[0], "upper_bound": p[1]}
+                    for i, p in enumerate(partition)
+                ]
+                save_checkpoint(cp_path, cp)
+            if len(partition) > 1:
+                print(f"  [{rel_type}] partitioned into {len(partition)} workers "
+                      f"(rel_total={rel_total:,})")
+            elif parallel_rels > 1:
+                print(f"  [{rel_type}] count={rel_total:,} below parallel threshold; "
+                      f"running single-worker")
 
-        if last_eid:
-            done_so_far = count_query(
-                src,
-                f"MATCH ()-[r:`{rel_type}`]->() WHERE elementId(r) <= $last_eid "
-                "RETURN count(r) AS cnt",
-                {"last_eid": last_eid},
+        n = len(partition)
+        state_holder: List[Optional[_AutoTuneState]] = [None] * n
+        # n=1 keeps the original auto-tune-rich heartbeat format (last_batch_rate,
+        # batch, ceiling, soft_ceiling) so --parallel-rels=1 stays bit-comparable
+        # with main for regression testing. n>1 uses the compact per-worker view.
+        hb = _Heartbeat(rel_type, rel_total, timings=timings,
+                        worker_states=state_holder if n > 1 else None)
+        # For n=1, hb.state is assigned by the worker once it constructs the
+        # _AutoTuneState (worker runs in this thread; hb.state read is atomic).
+
+        rel_written_total = 0
+
+        if n == 1:
+            rel_written_total = _migrate_rel_worker(
+                rel_type=rel_type, src=src, tgt=tgt, id_map_path=id_map_path,
+                in_mem_id_map=in_mem_id_map,
+                cp=cp, cp_path=cp_path, cp_lock=cp_lock,
+                worker_id=0, n_workers=1,
+                initial_last_eid=partition[0][0], upper_bound=partition[0][1],
+                batch_size=batch_size, auto_tune=auto_tune,
+                autotune_initial=autotune_initial, rel_total=rel_total,
+                state_holder=state_holder, timings=timings, hb=hb,
+                pbar=pbar, pbar_lock=pbar_lock,
             )
-            print(f"  [{rel_type}] resuming after {done_so_far:,}/{rel_total:,}")
-            if pbar:
-                pbar.update(done_so_far)
-            hb.done = done_so_far
+        else:
+            try:
+                with ThreadPoolExecutor(max_workers=n, thread_name_prefix=f"rel-{rel_type}") as ex:
+                    futures = {
+                        ex.submit(
+                            _migrate_rel_worker,
+                            rel_type=rel_type, src=src, tgt=tgt, id_map_path=id_map_path,
+                            in_mem_id_map=in_mem_id_map,
+                            cp=cp, cp_path=cp_path, cp_lock=cp_lock,
+                            worker_id=i, n_workers=n,
+                            initial_last_eid=partition[i][0], upper_bound=partition[i][1],
+                            batch_size=batch_size, auto_tune=auto_tune,
+                            autotune_initial=autotune_initial, rel_total=rel_total,
+                            state_holder=state_holder, timings=timings, hb=hb,
+                            pbar=pbar, pbar_lock=pbar_lock,
+                        ): i for i in range(n)
+                    }
+                    first_exc: Optional[BaseException] = None
+                    for fut in as_completed(futures):
+                        try:
+                            rel_written_total += fut.result()
+                        except BaseException as exc:
+                            if first_exc is None:
+                                first_exc = exc
+                                _shutdown_event.set()
+                                print(f"  [{rel_type}] worker {futures[fut]} raised "
+                                      f"{type(exc).__name__}; signalling other workers to exit",
+                                      file=sys.stderr, flush=True)
+                    if first_exc is not None:
+                        raise first_exc
+            finally:
+                # Always clear so a SIGINT- or exception-set event from this rel
+                # type doesn't leak into the next iteration. The signal handler
+                # is the only path that matters in practice (it sys.exits before
+                # the loop continues), but the finally makes the contract explicit
+                # and safe for any future caller that catches the re-raise.
+                _shutdown_event.clear()
 
-        while True:
-            current_limit = state.next_size() if state is not None else batch_size
-            records = run_query(
-                src,
-                f"MATCH (a)-[r:`{rel_type}`]->(b) WHERE elementId(r) > $last_eid "
-                "RETURN elementId(r) AS r_eid, elementId(a) AS start_eid, "
-                "       elementId(b) AS end_eid, properties(r) AS props "
-                f"ORDER BY elementId(r) LIMIT {current_limit}",
-                {"last_eid": last_eid},
-            )
-            if not records:
-                break
+        migrated += rel_written_total
 
-            # Resolve source elementIds → target elementIds in one SQLite query
-            all_source_eids = list(
-                {r["start_eid"] for r in records} | {r["end_eid"] for r in records}
-            )
-            eid_map = id_map_get(id_map, all_source_eids)
-
-            batch_data = []
-            missing = 0
-            for r in records:
-                t_start = eid_map.get(r["start_eid"])
-                t_end   = eid_map.get(r["end_eid"])
-                if t_start and t_end:
-                    batch_data.append({
-                        "start_eid": t_start,
-                        "end_eid":   t_end,
-                        "props":     r["props"],
-                    })
-                else:
-                    missing += 1
-
-            if missing:
-                print(f"    WARN: {missing} relationships skipped (node not in ID map)")
-
-            iteration_t0 = time.time() if state is not None else None
-            iteration_oom = False
-
-            if batch_data:
-                cypher = (
-                    "UNWIND $batch AS row "
-                    "MATCH (a) WHERE elementId(a) = row.start_eid "
-                    "MATCH (b) WHERE elementId(b) = row.end_eid "
-                    f"CREATE (a)-[r:`{rel_type}`]->(b) "
-                    "SET r = row.props "
-                    "RETURN count(r) AS created"
-                )
-                if state is not None:
-                    _, _, oom = _write_with_oom_retry(tgt, cypher, batch_data, state)
-                    iteration_oom = oom
-                else:
-                    run_query(tgt, cypher, {"batch": batch_data})
-
-            if state is not None and not iteration_oom and iteration_t0 is not None:
-                state.record_batch(len(batch_data), time.time() - iteration_t0)
-
-            count = len(records)
-            last_eid = records[-1]["r_eid"]
-            rel_written += len(batch_data)
-            migrated += len(batch_data)
-
-            if pbar:
-                pbar.update(count)
-            hb.tick(count)
-
-            cp["rel_type_last_eid"][rel_type] = last_eid
+        with cp_lock:
+            cp["rel_types_complete"].append(rel_type)
+            cp.get("rel_type_workers", {}).pop(rel_type, None)
+            cp["rel_type_last_eid"].pop(rel_type, None)
             save_checkpoint(cp_path, cp)
-
-            if count < current_limit:
-                break
-
-        cp["rel_types_complete"].append(rel_type)
-        cp["rel_type_last_eid"].pop(rel_type, None)
-        save_checkpoint(cp_path, cp)
-        print(f"  [{rel_type}] {rel_written:,} relationships written (source total: {rel_total:,})")
+        print(f"  [{rel_type}] {rel_written_total:,} relationships written "
+              f"(source total: {rel_total:,})")
 
     if pbar:
         pbar.close()
@@ -1004,6 +1493,12 @@ def _build_passthrough_flags(args: argparse.Namespace) -> str:
         flags.append(f"--batch-size {args.batch_size}")
     if not args.auto_tune_batch_size:
         flags.append("--no-auto-tune-batch-size")
+    if args.profile_batches:
+        flags.append("--profile-batches")
+    if args.parallel_rels != DEFAULT_PARALLEL_RELS:
+        flags.append(f"--parallel-rels {args.parallel_rels}")
+    if args.id_map_mode != "memory":
+        flags.append(f"--id-map-mode {args.id_map_mode}")
     return " ".join(flags)
 
 
@@ -1024,8 +1519,10 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
     print(f"  Type    : {args.instance_type}")
     print("═" * 62)
 
-    source_password = getpass.getpass("\nSource Aura password: ")
-    target_password = getpass.getpass("Target Aura password: ")
+    # Honor env-var/CLI passwords (matches the documented Usage in the module
+    # docstring); only prompt interactively for whichever is missing.
+    source_password = args.source_password or getpass.getpass("\nSource Aura password: ")
+    target_password = args.target_password or getpass.getpass("Target Aura password: ")
 
     run_id = uuid.uuid4().hex[:8]
     ssm_prefix = f"/aura-migration/{run_id}"
@@ -1076,11 +1573,16 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
 
         passthrough = _build_passthrough_flags(args)
 
-        # Embed the local script via base64 chunks instead of fetching from GitHub.
-        # This guarantees the EC2 runs exactly the local code (no "main vs working tree"
-        # foot-gun, no supply-chain risk from an unpinned raw URL).
+        # Embed the local script via base64-of-gzip chunks instead of fetching from
+        # GitHub. Embedding guarantees the EC2 runs exactly the local code (no
+        # "main vs working tree" foot-gun, no supply-chain risk from an unpinned
+        # raw URL). Gzip first because raw base64 of the script overflows SSM
+        # SendCommand's 97 KB document+parameters limit once the file gets past
+        # ~73 KB; gzip+base64 typically brings it back under 30 KB with plenty
+        # of headroom for future growth.
+        import gzip
         script_bytes = Path(__file__).resolve().read_bytes()
-        script_b64 = base64.b64encode(script_bytes).decode()
+        script_b64 = base64.b64encode(gzip.compress(script_bytes)).decode()
         chunk_size = 4096
         chunks = [script_b64[i : i + chunk_size] for i in range(0, len(script_b64), chunk_size)]
 
@@ -1089,13 +1591,13 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
             "set -euo pipefail",
             # Amazon Linux 2023 ships python3 but not pip — install it first.
             "sudo dnf -y -q install python3-pip",
-            "pip3 install -q neo4j tqdm",
+            "pip3 install -q neo4j tqdm psutil",
             "rm -f /tmp/migrate.b64 /tmp/migrate.py",
         ]
         for chunk in chunks:
             command_lines.append(f'printf "%s" "{chunk}" >> /tmp/migrate.b64')
         command_lines.extend([
-            "base64 -d /tmp/migrate.b64 > /tmp/migrate.py",
+            "base64 -d /tmp/migrate.b64 | gunzip > /tmp/migrate.py",
             "rm -f /tmp/migrate.b64",
             # Aura passwords go through env vars, not argv, so they don't leak via /proc.
             f'export SOURCE_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
@@ -1179,6 +1681,26 @@ def parse_args() -> argparse.Namespace:
                      help="Adapt batch size at runtime based on per-batch wall-time, "
                           "OOMs, and throughput plateau (default: ON). "
                           "Use --no-auto-tune-batch-size to disable and run with a fixed --batch-size.")
+    beh.add_argument("--profile-batches",  action="store_true",
+                     help="Emit per-stage timing breakdown (src_read, id_map_get, group, "
+                          "tgt_write, id_map_put, ckpt_save) at each heartbeat tick. "
+                          "Off by default; flip on when investigating throughput.")
+    beh.add_argument("--parallel-rels",    type=int, default=DEFAULT_PARALLEL_RELS,
+                     metavar="N",
+                     help=f"Phase 3 workers per rel type (default: {DEFAULT_PARALLEL_RELS}). "
+                          "1 = sequential (pre-v3 behavior). Each worker opens its own "
+                          "READ-mode source session so Bolt routing distributes reads "
+                          "across the source cluster's followers. Auto-clamps to 1 for "
+                          "rel types smaller than MIN_BATCH * N.")
+    beh.add_argument("--id-map-mode",      choices=["memory", "sqlite"], default="memory",
+                     help="Phase 3 id_map storage. 'memory' (default) loads the full "
+                          "SQLite id_map into a Python dict at Phase 3 start so "
+                          "parallel workers do GIL-protected lookups instead of "
+                          "concurrent SQLite reads (eliminates the ~2.6× id_map_get "
+                          "overhead measured under N>=2). 'sqlite' keeps per-worker "
+                          "SQLite connections — use when the host doesn't have enough "
+                          "RAM for the full id_map (~256 bytes per source node; see "
+                          "README §Sizing).")
     beh.add_argument("--overwrite",        action="store_true",
                      help="Proceed even if target is not empty")
     beh.add_argument("--resume",           action="store_true",
@@ -1203,8 +1725,11 @@ def parse_args() -> argparse.Namespace:
                      help="Security group ID — must allow outbound 7687 (AWS_SECURITY_GROUP_ID)")
     ec2.add_argument("--instance-profile",  default=os.environ.get("AWS_INSTANCE_PROFILE"),
                      help="IAM instance profile ARN — needs ssm:GetParameter (AWS_INSTANCE_PROFILE)")
-    ec2.add_argument("--instance-type",     default="t3.medium",
-                     help="EC2 instance type (default: t3.medium)")
+    ec2.add_argument("--instance-type",     default="t3.large",
+                     help="EC2 instance type (default: t3.large — 8 GB, "
+                          "covers ≤5M-node graphs in --id-map-mode=memory. "
+                          "Bump to t3.xlarge / t3.2xlarge for larger graphs; "
+                          "see README §Sizing).")
     ec2.add_argument("--aws-region",        default=os.environ.get("AWS_DEFAULT_REGION"),
                      help="AWS region (default: AWS_DEFAULT_REGION or boto3 default)")
 
@@ -1275,8 +1800,12 @@ def main() -> None:
         tgt = open_driver(args.target_uri, args.target_user, args.target_password, "target")
         id_map = open_id_map(args.id_map_db)
 
-        # Save checkpoint on Ctrl-C so --resume can pick up cleanly
+        # Save checkpoint on Ctrl-C so --resume can pick up cleanly. Setting
+        # _shutdown_event first asks any running Phase 3 workers to exit between
+        # batches; in-flight batches finish (or fail their retries) before the
+        # workers return.
         def _handle_sigint(sig, frame):
+            _shutdown_event.set()
             print("\n\n  Interrupted — checkpoint saved. Re-run with --resume to continue.")
             save_checkpoint(args.checkpoint_file, cp)
             if src: src.close()
@@ -1288,6 +1817,10 @@ def main() -> None:
         # ── Phase 0 ───────────────────────────────────────────────────────────
         # --resume implies the target is expected to have prior-run data.
         counts = preflight(src, tgt, args.overwrite or args.dry_run or args.resume)
+
+        # Memory sizing recommendation / hard fail for in-memory id_map mode.
+        # Done after preflight so we have an authoritative source node count.
+        _preflight_id_map_memory(counts["src_nodes"], args.id_map_mode)
 
         if args.dry_run:
             print("\n  Dry run complete — no data written.")
@@ -1311,6 +1844,7 @@ def main() -> None:
                 src, tgt, id_map, cp, args.checkpoint_file,
                 args.batch_size, counts["src_nodes"],
                 auto_tune=args.auto_tune_batch_size,
+                profile_batches=args.profile_batches,
             )
 
         # ── Phase 3 ───────────────────────────────────────────────────────────
@@ -1318,9 +1852,12 @@ def main() -> None:
             print("\n── Phase 3: Relationships — SKIPPED (already complete)")
         else:
             migrate_relationships(
-                src, tgt, id_map, cp, args.checkpoint_file,
+                src, tgt, args.id_map_db, cp, args.checkpoint_file,
                 args.batch_size, counts["src_rels"],
                 auto_tune=args.auto_tune_batch_size,
+                profile_batches=args.profile_batches,
+                parallel_rels=args.parallel_rels,
+                id_map_mode=args.id_map_mode,
             )
 
         # ── Phase 4 ───────────────────────────────────────────────────────────
