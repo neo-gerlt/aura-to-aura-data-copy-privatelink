@@ -5,6 +5,11 @@ migration_run*.log
 target_wipe.log
 mtg_load.log
 
+# Internal test infrastructure that should never be committed (dataset-specific
+# loaders, scratch scripts, etc.). Generic, dataset-agnostic test helpers can
+# live in test/ and are tracked normally.
+mtg_load.py
+
 # Python
 __pycache__/
 *.pyc
