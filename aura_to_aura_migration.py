@@ -1439,11 +1439,16 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
 
         passthrough = _build_passthrough_flags(args)
 
-        # Embed the local script via base64 chunks instead of fetching from GitHub.
-        # This guarantees the EC2 runs exactly the local code (no "main vs working tree"
-        # foot-gun, no supply-chain risk from an unpinned raw URL).
+        # Embed the local script via base64-of-gzip chunks instead of fetching from
+        # GitHub. Embedding guarantees the EC2 runs exactly the local code (no
+        # "main vs working tree" foot-gun, no supply-chain risk from an unpinned
+        # raw URL). Gzip first because raw base64 of the script overflows SSM
+        # SendCommand's 97 KB document+parameters limit once the file gets past
+        # ~73 KB; gzip+base64 typically brings it back under 30 KB with plenty
+        # of headroom for future growth.
+        import gzip
         script_bytes = Path(__file__).resolve().read_bytes()
-        script_b64 = base64.b64encode(script_bytes).decode()
+        script_b64 = base64.b64encode(gzip.compress(script_bytes)).decode()
         chunk_size = 4096
         chunks = [script_b64[i : i + chunk_size] for i in range(0, len(script_b64), chunk_size)]
 
@@ -1458,7 +1463,7 @@ def run_ec2_mode(args: argparse.Namespace) -> None:
         for chunk in chunks:
             command_lines.append(f'printf "%s" "{chunk}" >> /tmp/migrate.b64')
         command_lines.extend([
-            "base64 -d /tmp/migrate.b64 > /tmp/migrate.py",
+            "base64 -d /tmp/migrate.b64 | gunzip > /tmp/migrate.py",
             "rm -f /tmp/migrate.b64",
             # Aura passwords go through env vars, not argv, so they don't leak via /proc.
             f'export SOURCE_AURA_PASSWORD=$(aws ssm get-parameter --region {region} --name "{src_pw_path}" --with-decryption --query Parameter.Value --output text)',
