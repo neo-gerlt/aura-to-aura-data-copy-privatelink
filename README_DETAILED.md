@@ -1,4 +1,4 @@
-# Aura-to-Aura Data Copy — Detailed Reference (AWS)
+# Aura-to-Aura Data Copy with PrivateLink — Detailed Reference (AWS)
 
 > **Scope: AWS only.** Every cloud-orchestration path in this script targets
 > AWS specifically — `boto3` for EC2 launch/terminate, AWS Systems Manager
